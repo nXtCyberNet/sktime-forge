@@ -1,43 +1,59 @@
-﻿from typing import Dict, Any
+﻿from typing import Dict, Any, List
+
 
 def get_dataset_history_tool(dataset_id: str, memory_dict: Dict[str, Any]) -> Dict[str, Any]:
     if not memory_dict:
         return {
-            "status": "no_history_found",
-            "production_memory_summary": f"No previous memory exists for dataset {dataset_id}. This is a cold start.",
-            "next_action_hint": "profile_dataset"
+            "status": "cold_start",
+            "production_memory_summary": (
+                f"No previous production history exists for dataset '{dataset_id}'. "
+                "This is a first-time run. All model choices are exploratory."
+            ),
+            "model_history": [],
+            "drift_events": [],
+            "data_characteristics": {},
+            "failed_estimators": {},
         }
-        
-    model_history = memory_dict.get("model_history", [])
-    drift_events = memory_dict.get("drift_events", [])
-    
-    # Intelligently construct a summary of past failures for the prompt context
+
+    model_history: List[Dict] = memory_dict.get("model_history", [])
+    drift_events: List[Dict] = memory_dict.get("drift_events", [])
+    data_characteristics: Dict = memory_dict.get("data_characteristics", {})
+
+    # ---------- Summarise failures ----------
     failures = [m for m in model_history if m.get("failure_reason")]
-    recent_drift = drift_events[-1] if drift_events else None
-    
+    failed_estimators: Dict[str, int] = {}
+    for f in failures:
+        est = f.get("estimator", "Unknown")
+        failed_estimators[est] = failed_estimators.get(est, 0) + 1
+
+    # ---------- Build a narrative summary for LLM context ----------
     summary_parts = []
-    if failures:
-        summary_parts.append(f"{len(failures)} past model failures recorded.")
-        # Group by estimator
-        failed_estimators = {}
-        for f in failures:
-            est = f.get("estimator", "Unknown")
-            failed_estimators[est] = failed_estimators.get(est, 0) + 1
-        
+
+    if failed_estimators:
         for est, count in failed_estimators.items():
-            summary_parts.append(f"Avoid {est} (failed {count} times).")
-            
-    if recent_drift:
-        summary_parts.append(f"Most recent drift was {recent_drift.get('method', 'Unknown')} with score {recent_drift.get('score', 'N/A')}.")
-        
-    if not summary_parts:
-        summary_parts.append("Stable history, no major failures recorded.")
-        
+            noun = "failure" if count == 1 else "failures"
+            summary_parts.append(f"{est} has {count} recorded {noun} on this dataset.")
+    else:
+        summary_parts.append("No model failures recorded — production history is stable.")
+
+    if drift_events:
+        recent = drift_events[-1]
+        summary_parts.append(
+            f"Most recent drift event: method={recent.get('method', 'unknown')}, "
+            f"level={recent.get('level', 'unknown')}, "
+            f"score={recent.get('score', 'N/A')}."
+        )
+    else:
+        summary_parts.append("No drift events recorded.")
+
     return {
         "status": "history_retrieved",
         "production_memory_summary": " ".join(summary_parts),
         "model_history": model_history,
         "drift_events": drift_events,
-        "data_characteristics": memory_dict.get("data_characteristics", {}),
-        "next_action_hint": "run_stationarity_test"
+        "data_characteristics": data_characteristics,
+        # Structured failure index — more useful to the LLM than a prose list
+        "failed_estimators": failed_estimators,
+        # No next_action_hint — the LLM decides what evidence gap remains after
+        # reading production history. It may already have enough to compose a pipeline.
     }
