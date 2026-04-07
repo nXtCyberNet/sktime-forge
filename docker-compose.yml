@@ -1,0 +1,59 @@
+services:
+  valkey:
+    image: valkey/valkey:8
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root s3://sktime-agentic-models
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+
+  python-worker:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    env_file:
+      - ./python/.env.example
+    ports:
+      - "8000:8000"
+    depends_on:
+      - valkey
+      - mlflow
+      - minio
+
+  go-gateway:
+    build:
+      context: ./go
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      VALKEY_ADDR: "valkey:6379"
+      PREDICTION_TIMEOUT_SECONDS: "30"
+    depends_on:
+      - valkey
+
+volumes:
+  valkey-data:
+  minio-data:

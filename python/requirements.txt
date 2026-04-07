@@ -1,0 +1,26 @@
+# Core ML
+sktime>=0.28.0
+statsmodels>=0.14.0
+numpy>=1.26.0
+pandas>=2.0.0
+river
+
+# MLflow + sktime flavour
+mlflow[sktime]>=2.12.0
+
+# Queue / cache
+redis>=5.0.0              # works with Valkey (API-compatible)
+
+# API layer
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+
+# LLM (at least one required — install both for provider flexibility)
+anthropic>=0.25.0
+openai>=1.25.0
+
+# Object storage (for production data loader)
+boto3>=1.34.0             # AWS S3
+google-cloud-storage>=2.16.0  # GCS (optional)
