@@ -1,8 +1,17 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    anthropic_api_key: str = ""
-    llm_model: str = "claude-sonnet-4-20250514"
+    llm_provider: str = "openai_compatible"
+    llm_api_key: str = ""
+    anthropic_api_key: str = ""  # legacy fallback
+    llm_api_url: str = "https://api.openai.com/v1/chat/completions"
+    llm_api_version: str = "2023-06-01"
+    llm_auth_header: str = "Authorization"
+    llm_auth_scheme: str = "Bearer"
+    llm_extra_headers_json: str = ""
+    llm_model: str = "gpt-4o-mini"
+    llm_max_tokens: int = 256
+    llm_timeout_seconds: float = 30.0
     valkey_url: str = "redis://localhost:6379"
     retrain_lock_ttl_seconds: int = 1800
     max_training_time_seconds: int = 3600
