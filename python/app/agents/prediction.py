@@ -1,17 +1,3 @@
-"""
-PredictionAgent
-===============
-Serves online forecast requests from the model registered by TrainingAgent.
-
-Key fixes vs original
----------------------
-- _run_inference now passes a ForecastingHorizon to model.predict(), not a
-  bare np.ndarray. sktime forecasters require ForecastingHorizon.
-- asyncio.get_event_loop() replaced with asyncio.get_running_loop() (3.10+).
-- Model loading tries mlflow.sklearn first, then mlflow.pyfunc as fallback.
-- Prediction counter uses a pipeline() context manager correctly.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +8,7 @@ from typing import Any
 import mlflow.pyfunc
 import mlflow.sklearn
 import numpy as np
+import pandas as pd
 from sktime.forecasting.base import ForecastingHorizon
 
 from app.schemas import ForecastRequest, ForecastResponse
@@ -32,6 +19,7 @@ _MODEL_VER_KEY  = "model_version:{dataset_id}"
 _PRED_COUNT_KEY = "pred_count:{dataset_id}"
 _PRED_COUNT_TTL = 86_400   # 24 h
 _DEFAULT_HORIZON = 10
+_DEFAULT_INTERVAL_COVERAGE = 0.9
 
 
 class PredictionAgent:
@@ -106,7 +94,7 @@ class PredictionAgent:
         # ---- 3. Run inference off the event loop (sktime is not async-safe) ----
         t0 = time.monotonic()
         try:
-            predictions = await asyncio.get_running_loop().run_in_executor(
+            predictions, prediction_intervals = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self._run_inference(model, fh_values),
             )
@@ -123,14 +111,14 @@ class PredictionAgent:
         response = ForecastResponse(
             dataset_id    = dataset_id,
             predictions   = predictions,
-            prediction_intervals = None,
+            prediction_intervals = prediction_intervals,
             model_version = model_version,
             model_class   = type(model).__name__,
             model_status  = "ok",
             drift_score   = None,
             drift_method  = None,
             warning       = None,
-            llm_rationale = f"served_in_ms={round(elapsed_ms, 2)}",
+            llm_rationale = None,
             cache_hit     = cache_hit,
             correlation_id= job.correlation_id,
         )
@@ -149,7 +137,11 @@ class PredictionAgent:
     # Inference
     # ------------------------------------------------------------------
 
-    def _run_inference(self, model: Any, fh_values: list[int]) -> list[float]:
+    def _run_inference(
+        self,
+        model: Any,
+        fh_values: list[int],
+    ) -> tuple[list[float], dict[str, list[float]] | None]:
         """
         Call model.predict() with a proper ForecastingHorizon.
 
@@ -157,12 +149,133 @@ class PredictionAgent:
         is_relative=True means "1 step ahead, 2 steps ahead, …" relative to
         the end of the training series.
         """
-        fh  = ForecastingHorizon(fh_values, is_relative=True)
+        # MLflow pyfunc models expect tabular input; native sktime forecasters
+        # expect a ForecastingHorizon.
+        if hasattr(model, "unwrap_python_model"):
+            raw = model.predict(pd.DataFrame({"fh": fh_values}))
+            return self._to_float_list(raw), None
+
+        fh = ForecastingHorizon(fh_values, is_relative=True)
         raw = model.predict(fh)
+        predictions = self._to_float_list(raw)
+        intervals = self._try_predict_intervals(model, fh)
+        return predictions, intervals
+
+    @staticmethod
+    def _to_float_list(raw: Any) -> list[float]:
+        if isinstance(raw, pd.DataFrame):
+            if raw.shape[1] == 0:
+                return []
+            return [float(v) for v in raw.iloc[:, 0].tolist()]
 
         if hasattr(raw, "values"):
-            return [float(v) for v in raw.values]
-        return [float(v) for v in raw]
+            return [float(v) for v in np.ravel(raw.values)]
+
+        return [float(v) for v in np.ravel(raw)]
+
+    def _try_predict_intervals(
+        self,
+        model: Any,
+        fh: ForecastingHorizon,
+    ) -> dict[str, list[float]] | None:
+        coverage = float(
+            getattr(self.settings, "prediction_interval_coverage", _DEFAULT_INTERVAL_COVERAGE)
+        )
+        coverage = min(max(coverage, 1e-6), 0.999999)
+
+        if hasattr(model, "predict_interval"):
+            interval_df = self._call_predict_interval(model, fh, coverage)
+            parsed = self._extract_interval_bounds(interval_df)
+            if parsed is not None:
+                return parsed
+
+        if hasattr(model, "predict_quantiles"):
+            quant_df = self._call_predict_quantiles(model, fh, coverage)
+            parsed = self._extract_quantile_bounds(quant_df)
+            if parsed is not None:
+                return parsed
+
+        return None
+
+    @staticmethod
+    def _call_predict_interval(
+        model: Any,
+        fh: ForecastingHorizon,
+        coverage: float,
+    ) -> Any | None:
+        try:
+            return model.predict_interval(fh=fh, coverage=[coverage])
+        except TypeError:
+            try:
+                return model.predict_interval(fh=fh, coverage=coverage)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _call_predict_quantiles(
+        model: Any,
+        fh: ForecastingHorizon,
+        coverage: float,
+    ) -> Any | None:
+        alpha = (1.0 - coverage) / 2.0
+        upper_alpha = 1.0 - alpha
+        try:
+            return model.predict_quantiles(fh=fh, alpha=[alpha, upper_alpha])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_interval_bounds(data: Any) -> dict[str, list[float]] | None:
+        if not isinstance(data, pd.DataFrame) or data.empty:
+            return None
+
+        if isinstance(data.columns, pd.MultiIndex):
+            lower_cols = [c for c in data.columns if str(c[-1]).lower() == "lower"]
+            upper_cols = [c for c in data.columns if str(c[-1]).lower() == "upper"]
+            if lower_cols and upper_cols:
+                lower = [float(v) for v in data[lower_cols[0]].tolist()]
+                upper = [float(v) for v in data[upper_cols[0]].tolist()]
+                if len(lower) == len(upper):
+                    return {"lower": lower, "upper": upper}
+            return None
+
+        lower_col = next((c for c in data.columns if str(c).lower() == "lower"), None)
+        upper_col = next((c for c in data.columns if str(c).lower() == "upper"), None)
+        if lower_col is None or upper_col is None:
+            return None
+
+        lower = [float(v) for v in data[lower_col].tolist()]
+        upper = [float(v) for v in data[upper_col].tolist()]
+        if len(lower) != len(upper):
+            return None
+        return {"lower": lower, "upper": upper}
+
+    @staticmethod
+    def _extract_quantile_bounds(data: Any) -> dict[str, list[float]] | None:
+        if not isinstance(data, pd.DataFrame) or data.empty:
+            return None
+
+        if isinstance(data.columns, pd.MultiIndex):
+            cols = list(data.columns)
+            sorted_cols = sorted(cols, key=lambda c: float(c[-1]))
+            lower_col = sorted_cols[0]
+            upper_col = sorted_cols[-1]
+            lower = [float(v) for v in data[lower_col].tolist()]
+            upper = [float(v) for v in data[upper_col].tolist()]
+            if len(lower) == len(upper):
+                return {"lower": lower, "upper": upper}
+            return None
+
+        if len(data.columns) < 2:
+            return None
+        sorted_cols = sorted(data.columns, key=lambda c: float(c))
+        lower = [float(v) for v in data[sorted_cols[0]].tolist()]
+        upper = [float(v) for v in data[sorted_cols[-1]].tolist()]
+        if len(lower) != len(upper):
+            return None
+        return {"lower": lower, "upper": upper}
 
     # ------------------------------------------------------------------
     # Model loading

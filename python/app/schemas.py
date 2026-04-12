@@ -11,6 +11,7 @@ class ForecastRequest(BaseModel):
     fh: List[int]
     correlation_id: str
     frequency: Optional[str] = None
+    actual: Optional[float] = None
 
     @field_validator("fh")
     @classmethod
@@ -39,6 +40,27 @@ class RetrainJob(BaseModel):
     dataset_id: str
     reason: str
     triggered_at: datetime
+
+
+class AdminRetrainRequest(BaseModel):
+    dataset_id: str
+    reason: str = "manual"
+
+
+class AdminRetrainResponse(BaseModel):
+    dataset_id: str
+    reason: str
+    queued: bool
+    stream_id: Optional[str] = None
+
+
+class AdminModelResponse(BaseModel):
+    dataset_id: str
+    model_version: Optional[str] = None
+    model_class: Optional[str] = None
+    cv_score: Optional[float] = None
+    promoted_at: Optional[datetime] = None
+    drift_reason: Optional[str] = None
 
 
 class DataProfile(BaseModel):

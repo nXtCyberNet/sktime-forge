@@ -144,8 +144,10 @@ class TestSchemas:
             fh=[1, 2, 3],
             correlation_id="abc-123",
             frequency="D",
+            actual=42.5,
         )
         assert req.fh == [1, 2, 3]
+        assert req.actual == 42.5
 
     def test_forecast_request_invalid_fh(self):
         from app.schemas import ForecastRequest
@@ -253,6 +255,80 @@ class TestForbiddenModelStripping:
         result = await agent.select(type("Job", (), {"dataset_id": "ds-2"})())
         assert result == ["NaiveForecaster"]
 
+    @pytest.mark.asyncio
+    async def test_registry_filters_non_registry_estimators(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.agents.model_selector import ModelSelectorAgent
+        from app.schemas import DataProfile
+
+        profile = DataProfile(
+            dataset_id="ds-3",
+            n_observations=120,
+            complexity_budget={
+                "permitted_models": ["UnknownForecaster", "AutoARIMA", "NaiveForecaster"],
+                "forbidden_models": [],
+            },
+            dataset_history={},
+        )
+        mock_valkey.get = AsyncMock(return_value=profile.model_dump_json().encode())
+
+        agent = ModelSelectorAgent(mock_valkey, mock_mlflow_client, None, settings)
+        agent._llm_select = AsyncMock(
+            return_value=["UnknownForecaster", "AutoARIMA", "NaiveForecaster"]
+        )
+
+        result = await agent.select(type("Job", (), {"dataset_id": "ds-3"})())
+        assert result == ["AutoARIMA", "NaiveForecaster"]
+
+    @pytest.mark.asyncio
+    async def test_empty_registry_allowed_set_falls_back_to_naive(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.agents.model_selector import ModelSelectorAgent
+        from app.schemas import DataProfile
+
+        profile = DataProfile(
+            dataset_id="ds-4",
+            n_observations=80,
+            complexity_budget={
+                "permitted_models": ["UnknownForecaster"],
+                "forbidden_models": [],
+            },
+            dataset_history={},
+        )
+        mock_valkey.get = AsyncMock(return_value=profile.model_dump_json().encode())
+
+        agent = ModelSelectorAgent(mock_valkey, mock_mlflow_client, None, settings)
+        agent._llm_select = AsyncMock(return_value=["UnknownForecaster"])
+
+        result = await agent.select(type("Job", (), {"dataset_id": "ds-4"})())
+        assert result == ["NaiveForecaster"]
+
+
+class TestTrainingCandidateValidation:
+    def test_sanitize_candidates_drops_unsupported(self, mock_valkey, mock_mlflow_client, settings):
+        from app.agents.training import TrainingAgent
+
+        agent = TrainingAgent(mock_valkey, mock_mlflow_client, settings)
+        sanitized = agent._sanitize_candidates(
+            ["UnknownForecaster", "NaiveForecaster", "UnknownForecaster"],
+            dataset_id="ds-1",
+        )
+        assert sanitized == ["NaiveForecaster"]
+
+    def test_sanitize_candidates_returns_empty_when_none_supported(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.agents.training import TrainingAgent
+
+        agent = TrainingAgent(mock_valkey, mock_mlflow_client, settings)
+        sanitized = agent._sanitize_candidates(
+            ["UnknownForecaster", "AnotherUnknown"],
+            dataset_id="ds-1",
+        )
+        assert sanitized == []
+
 
 # ---------------------------------------------------------------------------
 # ModelSelectorAgent — LLM parse helpers
@@ -334,6 +410,67 @@ class TestPredictionAgent:
         k2 = ("ds-1", "v2")
         assert k1 != k2
 
+    def test_run_inference_returns_prediction_intervals_from_predict_interval(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.agents.prediction import PredictionAgent
+
+        class IntervalModel:
+            def predict(self, fh):
+                return pd.Series([10.0, 11.0], index=pd.RangeIndex(2), name="y")
+
+            def predict_interval(self, fh, coverage):
+                cols = pd.MultiIndex.from_tuples([
+                    ("y", 0.9, "lower"),
+                    ("y", 0.9, "upper"),
+                ])
+                return pd.DataFrame([[9.0, 11.0], [10.0, 12.0]], columns=cols)
+
+        agent = PredictionAgent(mock_valkey, mock_mlflow_client, settings)
+        preds, intervals = agent._run_inference(IntervalModel(), [1, 2])
+
+        assert preds == [10.0, 11.0]
+        assert intervals == {"lower": [9.0, 10.0], "upper": [11.0, 12.0]}
+
+    def test_run_inference_returns_prediction_intervals_from_quantiles(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.agents.prediction import PredictionAgent
+
+        class QuantileModel:
+            def predict(self, fh):
+                return np.array([5.0, 6.0])
+
+            def predict_quantiles(self, fh, alpha):
+                cols = pd.MultiIndex.from_tuples([
+                    ("y", alpha[0]),
+                    ("y", alpha[1]),
+                ])
+                return pd.DataFrame([[4.0, 6.0], [5.0, 7.0]], columns=cols)
+
+        agent = PredictionAgent(mock_valkey, mock_mlflow_client, settings)
+        preds, intervals = agent._run_inference(QuantileModel(), [1, 2])
+
+        assert preds == [5.0, 6.0]
+        assert intervals == {"lower": [4.0, 5.0], "upper": [6.0, 7.0]}
+
+    def test_run_inference_pyfunc_model_leaves_intervals_none(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.agents.prediction import PredictionAgent
+
+        class PyfuncLikeModel:
+            unwrap_python_model = object()
+
+            def predict(self, model_input):
+                return pd.DataFrame({"y": [1.0, 2.0]})
+
+        agent = PredictionAgent(mock_valkey, mock_mlflow_client, settings)
+        preds, intervals = agent._run_inference(PyfuncLikeModel(), [1, 2])
+
+        assert preds == [1.0, 2.0]
+        assert intervals is None
+
 
 # ---------------------------------------------------------------------------
 # DriftMonitor
@@ -346,8 +483,8 @@ class TestDriftMonitor:
 
         monitor = DriftMonitor(mock_valkey, settings)
         monitor._residuals["ds-1"] = deque(
-            [0.01] * 100, maxlen=100
-        )  # tiny stable residuals
+            [0.01 if i % 2 == 0 else -0.01 for i in range(100)], maxlen=100
+        )  # tiny zero-mean stable residuals
         monitor._prediction_counts["ds-1"]   = 50
         monitor._last_check_times["ds-1"]    = datetime(2020, 1, 1, tzinfo=timezone.utc)
         monitor._active_model_version["ds-1"] = "v1"
@@ -549,6 +686,44 @@ class TestOrchestrator:
         orch.model_selector.select.assert_not_called()
         orch.training_agent.handle_retrain_job.assert_not_called()
         assert result.model_version == "3"
+        assert isinstance(result.llm_rationale, str)
+        assert "dataset ds-1" in result.llm_rationale
+
+    def test_build_forecast_request_parses_actual(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.orchestrator import Orchestrator
+        from app.mcp.client import MCPClient
+
+        orch = Orchestrator(mock_valkey, mock_mlflow_client, MCPClient(), settings)
+        req = orch._build_forecast_request(
+            {
+                "dataset_id": "ds-9",
+                "fh": "[1,2]",
+                "correlation_id": "corr-9",
+                "actual": "123.4",
+            },
+            "1-0",
+        )
+        assert req.dataset_id == "ds-9"
+        assert req.actual == 123.4
+
+    @pytest.mark.asyncio
+    async def test_start_stream_workers_forecast_only(
+        self, mock_valkey, mock_mlflow_client, settings
+    ):
+        from app.orchestrator import Orchestrator
+        from app.mcp.client import MCPClient
+
+        orch = Orchestrator(mock_valkey, mock_mlflow_client, MCPClient(), settings)
+        orch._forecast_worker_loop = AsyncMock(return_value=None)
+        orch._retrain_worker_loop = AsyncMock(return_value=None)
+
+        await orch.start_stream_workers(include_forecast=True, include_retrain=False)
+        assert len(orch._worker_tasks) == 1
+        assert mock_valkey.xgroup_create.call_count == 1
+
+        await orch.stop_stream_workers()
 
 
 # ---------------------------------------------------------------------------
@@ -600,3 +775,77 @@ class TestAgentMemory:
         payload   = json.loads(call_args[0][2])
         assert len(payload["drift_events"]) == 1
         assert payload["drift_events"][0]["method"] == "CUSUM"
+
+
+class TestMainAPI:
+    @pytest.mark.asyncio
+    async def test_ready_check_ok(self, mock_valkey):
+        from app import main
+
+        mock_valkey.ping = AsyncMock(return_value=True)
+        main.app.state.valkey = mock_valkey
+
+        payload = await main.ready_check()
+        assert payload["status"] == "ready"
+
+    @pytest.mark.asyncio
+    async def test_admin_retrain_queues_job(self, mock_valkey):
+        from app import main
+        from app.schemas import AdminRetrainRequest
+
+        mock_valkey.exists = AsyncMock(return_value=False)
+        mock_valkey.setex = AsyncMock(return_value=True)
+        mock_valkey.xadd = AsyncMock(return_value=b"1-0")
+        main.app.state.valkey = mock_valkey
+
+        response = await main.admin_retrain(
+            AdminRetrainRequest(dataset_id="ds-admin", reason="manual"),
+            _auth=None,
+        )
+        assert response.queued is True
+        assert response.stream_id == "1-0"
+
+    @pytest.mark.asyncio
+    async def test_admin_model_info_reads_cache_and_memory(
+        self, mock_valkey, mock_mlflow_client
+    ):
+        from app import main
+
+        async def get_side_effect(key):
+            mapping = {
+                "model_version:ds-admin": b"5",
+                "model:class:ds-admin": b"AutoARIMA",
+            }
+            return mapping.get(key)
+
+        mock_valkey.get = AsyncMock(side_effect=get_side_effect)
+        main.app.state.valkey = mock_valkey
+        main.app.state.mlflow_client = mock_mlflow_client
+
+        class _Mem:
+            async def get_dataset_memory(self, dataset_id):
+                return {
+                    "model_history": [
+                        {
+                            "estimator": "AutoARIMA",
+                            "val_mae": 0.123,
+                            "promoted_at": "2026-04-12T00:00:00Z",
+                        }
+                    ],
+                    "drift_events": [{"method": "CUSUM"}],
+                }
+
+        main.app.state.agent_memory = _Mem()
+
+        response = await main.admin_model_info("ds-admin", _auth=None)
+        assert response.model_version == "5"
+        assert response.model_class == "AutoARIMA"
+        assert response.cv_score == 0.123
+        assert response.drift_reason == "CUSUM"
+
+    def test_metrics_endpoint_plain_text(self):
+        from app import main
+
+        response = main.metrics()
+        assert response.status_code == 200
+        assert "forecast_requests_total" in response.body.decode("utf-8")

@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from app.registry.registry import allowed_for_profile, validate_pipeline_spec
 from app.schemas import DataProfile
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ class ModelSelectorAgent:
 
         # ---- 1. Load DataProfile from Valkey ----
         profile: DataProfile = await self._load_profile(dataset_id)
+        profile_allowed = allowed_for_profile(profile)
+        if not profile_allowed:
+            profile_allowed = ["NaiveForecaster"]
 
         # ---- 2. Enrich with MLflow history ----
         mlflow_context = self._fetch_mlflow_context(dataset_id)
@@ -63,18 +67,30 @@ class ModelSelectorAgent:
         # ---- 3. Ask the LLM ----
         raw_candidates: list[str] = await self._llm_select(profile, mlflow_context)
 
-        # ---- 4. Strip forbidden models — hard Python constraint, never delegated ----
-        forbidden: set[str] = set(profile.complexity_budget.get("forbidden_models", []))
-        candidates = [m for m in raw_candidates if m not in forbidden]
+        # ---- 4. Constrain and validate against registry + profile budget ----
+        allowed_set = set(profile_allowed)
+        candidates: list[str] = []
+        for estimator in raw_candidates:
+            if estimator in allowed_set and estimator not in candidates:
+                candidates.append(estimator)
 
         if not candidates:
-            permitted = profile.complexity_budget.get("permitted_models", ["NaiveForecaster"])
-            candidates = permitted[:1]
+            candidates = profile_allowed[:1]
             logger.warning(
-                "ModelSelectorAgent: LLM returned only forbidden models for %s; "
+                "ModelSelectorAgent: LLM returned no registry-valid candidates for %s; "
                 "falling back to %s",
                 dataset_id, candidates,
             )
+
+        spec = {"estimators": candidates}
+        if not validate_pipeline_spec(spec, registry=profile_allowed):
+            logger.warning(
+                "ModelSelectorAgent: candidate spec failed validation for %s; "
+                "falling back to %s",
+                dataset_id,
+                profile_allowed[:1],
+            )
+            candidates = profile_allowed[:1]
 
         # ---- 5. Persist to Valkey ----
         key = _CANDIDATE_KEY.format(dataset_id=dataset_id)
@@ -163,12 +179,21 @@ class ModelSelectorAgent:
             )
             return profile.complexity_budget.get("permitted_models", ["NaiveForecaster"])
 
-    async def _request_llm_text(self, system_prompt: str, user_message: str) -> str:
+    async def _request_llm_text(
+        self,
+        system_prompt: str,
+        user_message: str,
+        timeout_seconds: float | None = None,
+    ) -> str:
         """Fire the HTTP request and return the raw text content from the response."""
         url, headers, payload = self._build_llm_request(system_prompt, user_message)
-        timeout_seconds = float(getattr(self.settings, "llm_timeout_seconds", 30.0))
+        resolved_timeout = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(self.settings, "llm_timeout_seconds", 30.0)
+        )
 
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=resolved_timeout) as client:
             response = await client.post(url, headers=headers, json=payload)
             # raise_for_status() must be called INSIDE the async-with block
             # while the response object is still open.
@@ -356,7 +381,14 @@ class ModelSelectorAgent:
             best_mae            : float | None  — best validation MAE seen so far
         """
         try:
-            versions = self.mlflow.search_model_versions(f"tags.dataset_id='{dataset_id}'")
+            model_name = f"ts-forecaster-{dataset_id}"
+            versions = self.mlflow.search_model_versions(f"name='{model_name}'")
+            if not versions:
+                # Backward-compatible fallback for older registries that relied on tags.
+                versions = self.mlflow.search_model_versions(
+                    f"tags.dataset_id='{dataset_id}'"
+                )
+
             parsed: list[dict[str, Any]] = []
             best_mae: float | None = None
 

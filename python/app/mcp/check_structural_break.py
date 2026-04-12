@@ -3,20 +3,6 @@ from typing import Dict, Any, List, Optional
 
 
 def check_structural_break_tool(dataset_id: str, y: np.ndarray) -> Dict[str, Any]:
-    """
-    Detect structural breaks using the CUSUM (Cumulative Sum) test on the raw level.
-
-    Operates on the original series, not differenced — differencing destroys level
-    shifts, which are the primary signature of structural breaks.
-
-    Returns raw statistical evidence only: whether a break was detected, where, and
-    how confident the test is. The caller (LLM) decides how this interacts with
-    stationarity results, seasonality findings, and past model failures.
-
-    Test statistic:
-        CUSUM test stat = max|S_k| / (std * sqrt(n))
-        Critical value  = 1.358 * (1 + 0.1 * log(n))  [95% confidence, Brownian bridge]
-    """
     n = len(y)
 
     if n < 10:

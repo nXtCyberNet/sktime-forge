@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_max_tokens: int = 256
     llm_timeout_seconds: float = 30.0
+    llm_rationale_timeout_seconds: float = 6.0
+    enable_llm_rationale: bool = True
 
     # Valkey / Redis
     valkey_url: str = "redis://localhost:6379"
@@ -22,6 +24,7 @@ class Settings(BaseSettings):
     retrain_lock_ttl_seconds: int = 1800
     max_training_time_seconds: int = 3600
     result_ttl_seconds: int = 60
+    admin_api_token: str = ""
 
     # Drift thresholds — three levels: none < minor < major
     # Scores are in [0, 1]; a score below no_drift_threshold is clean.
@@ -37,6 +40,11 @@ class Settings(BaseSettings):
     # Prediction
     incremental_update_wait_seconds: int = 10
     default_horizon: int = 10
+    prediction_interval_coverage: float = 0.9
+
+    # Worker role toggles
+    enable_forecast_worker: bool = True
+    enable_retrain_worker: bool = False
 
     # Watchdog
     watchdog_poll_interval_s: int = 30
@@ -57,7 +65,7 @@ class Settings(BaseSettings):
     # Optional runtime-injected callables (not from .env)
     data_loader: object = None      # callable(dataset_id: str) -> np.ndarray
     memory_loader: object = None    # callable(dataset_id: str) -> dict
-    early_stop_mae: float = None    # type: ignore[assignment]
+    early_stop_mae: float | None = None
 
     class Config:
         env_file = ".env"

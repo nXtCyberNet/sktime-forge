@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -18,6 +19,8 @@ from sktime.performance_metrics.forecasting import (
     MeanAbsolutePercentageError,
     MeanSquaredError,
 )
+
+from app.registry.registry import validate_pipeline_spec
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,31 @@ _ESTIMATOR_MAP: dict[str, tuple[str, str, dict[str, Any]]] = {
 }
 
 
+class _SktimePyfuncModel(mlflow.pyfunc.PythonModel):
+    """PyFunc wrapper that serves a fitted sktime estimator by relative fh."""
+
+    def __init__(self, estimator: Any):
+        self._estimator = estimator
+
+    def predict(self, context, model_input):
+        if isinstance(model_input, pd.DataFrame):
+            if "fh" in model_input.columns:
+                fh_values = [int(v) for v in model_input["fh"].tolist()]
+            else:
+                fh_values = [int(v) for v in model_input.iloc[:, 0].tolist()]
+        elif isinstance(model_input, (list, tuple, np.ndarray, pd.Series)):
+            fh_values = [int(v) for v in list(model_input)]
+        else:
+            raise ValueError("Unsupported model_input for pyfunc forecast wrapper")
+
+        fh = ForecastingHorizon(fh_values, is_relative=True)
+        preds = self._estimator.predict(fh)
+
+        if hasattr(preds, "to_numpy"):
+            return preds.to_numpy()
+        return np.asarray(preds)
+
+
 class TrainingAgent:
     """
     Parameters
@@ -85,6 +113,7 @@ class TrainingAgent:
         self.valkey   = valkey
         self.mlflow   = mlflow_client   # MlflowClient — queries only
         self.settings = settings
+        self._last_training_summary: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -118,6 +147,7 @@ class TrainingAgent:
 
         # ---- 1. Fetch ranked candidate list from Valkey ----
         candidates: list[str] = await self._load_candidates(dataset_id)
+        candidates = self._sanitize_candidates(candidates, dataset_id)
         if not candidates:
             logger.error("TrainingAgent: no candidates found for %s – aborting", dataset_id)
             return None
@@ -173,6 +203,13 @@ class TrainingAgent:
             dataset_id, best["estimator_name"], best["val_mae"],
         )
 
+        self._last_training_summary[dataset_id] = {
+            "dataset_id": dataset_id,
+            "estimator_name": str(best["estimator_name"]),
+            "val_mae": float(best["val_mae"]),
+            "model_version": None,
+        }
+
         # ---- 6. Register in MLflow model registry ----
         model_version = await loop.run_in_executor(
             None, lambda: self._register_model(dataset_id, best)
@@ -184,6 +221,10 @@ class TrainingAgent:
         key = _MODEL_VER_KEY.format(dataset_id=dataset_id)
         await self.valkey.setex(key, _MODEL_VER_TTL, model_version)
 
+        # Compatibility keys used by the Go gateway cache/version endpoints.
+        await self.valkey.set(f"model:version:{dataset_id}", model_version)
+        await self.valkey.set(f"model:class:{dataset_id}", best["estimator_name"])
+
         # ---- 8. Publish model_updated signal for PredictionAgent cache eviction ----
         await self.valkey.setex(f"model_updated:{dataset_id}", 300, "1")
 
@@ -191,7 +232,12 @@ class TrainingAgent:
             "TrainingAgent: promoted model version %s for %s",
             model_version, dataset_id,
         )
+
+        self._last_training_summary[dataset_id]["model_version"] = str(model_version)
         return model_version
+
+    def get_last_training_summary(self, dataset_id: str) -> dict[str, Any] | None:
+        return self._last_training_summary.get(dataset_id)
 
     # ------------------------------------------------------------------
     # Per-estimator training loop (synchronous — runs in executor)
@@ -293,15 +339,15 @@ class TrainingAgent:
                     "estimator":  estimator_name,
                     "dataset_id": dataset_id,
                 })
-                # Log the fitted model artifact under the "model" key
-                try:
-                    mlflow.sklearn.log_model(estimator, artifact_path="model")
-                except Exception as log_exc:
-                    logger.warning(
-                        "TrainingAgent: mlflow.sklearn.log_model failed for %s (%s); "
-                        "trying pyfunc fallback",
-                        estimator_name, log_exc,
+
+                model_logged = self._log_model_artifact(estimator, estimator_name)
+                if not model_logged:
+                    logger.error(
+                        "TrainingAgent: model artifact logging failed for %s; "
+                        "skipping this candidate",
+                        estimator_name,
                     )
+                    return None
         except Exception as exc:
             logger.warning(
                 "TrainingAgent: MLflow run logging failed for %s: %s",
@@ -345,6 +391,39 @@ class TrainingAgent:
         mod = importlib.import_module(module_path)
         cls = getattr(mod, class_name)
         return cls(**default_kwargs)
+
+    def _log_model_artifact(self, estimator: Any, estimator_name: str) -> bool:
+        """
+        Log fitted model artifact under "model" in the active MLflow run.
+
+        Tries sklearn flavor first, then pyfunc fallback for non-sklearn estimators.
+        """
+        try:
+            mlflow.sklearn.log_model(estimator, artifact_path="model")
+            return True
+        except Exception as log_exc:
+            logger.warning(
+                "TrainingAgent: mlflow.sklearn.log_model failed for %s (%s); "
+                "trying pyfunc fallback",
+                estimator_name,
+                log_exc,
+            )
+
+        try:
+            pyfunc_model = _SktimePyfuncModel(estimator)
+            mlflow.pyfunc.log_model(
+                artifact_path="model",
+                python_model=pyfunc_model,
+                input_example=pd.DataFrame({"fh": [1, 2, 3]}),
+            )
+            return True
+        except Exception as pyfunc_exc:
+            logger.error(
+                "TrainingAgent: mlflow.pyfunc.log_model fallback failed for %s: %s",
+                estimator_name,
+                pyfunc_exc,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # MLflow helpers (synchronous — called from executor)
@@ -430,7 +509,9 @@ class TrainingAgent:
         if loader is not None:
             y = np.asarray(loader(dataset_id), dtype=float)
         else:
-            rng = np.random.default_rng(seed=int(hash(dataset_id) % 2**31))
+            digest = hashlib.sha256(dataset_id.encode("utf-8")).digest()
+            seed = int.from_bytes(digest[:8], byteorder="big", signed=False) % (2**31)
+            rng = np.random.default_rng(seed=seed)
             y   = rng.standard_normal(200).cumsum()
 
         split = max(5, int(len(y) * (1 - _VALIDATION_FRAC)))
@@ -457,3 +538,26 @@ class TrainingAgent:
                 dataset_id, exc,
             )
             return []
+
+    def _sanitize_candidates(self, candidates: list[str], dataset_id: str) -> list[str]:
+        """Validate and filter candidate estimators against runtime-supported registry."""
+        deduped = list(dict.fromkeys(str(c) for c in candidates))
+        runtime_registry = list(_ESTIMATOR_MAP.keys())
+
+        spec = {"estimators": deduped}
+        if validate_pipeline_spec(spec, registry=runtime_registry):
+            return deduped
+
+        filtered = [name for name in deduped if name in _ESTIMATOR_MAP]
+        dropped = [name for name in deduped if name not in _ESTIMATOR_MAP]
+        if dropped:
+            logger.warning(
+                "TrainingAgent: dropping unsupported estimators for %s: %s",
+                dataset_id,
+                dropped,
+            )
+
+        spec = {"estimators": filtered}
+        if validate_pipeline_spec(spec, registry=runtime_registry):
+            return filtered
+        return []

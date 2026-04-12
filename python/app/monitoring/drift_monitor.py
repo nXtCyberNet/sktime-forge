@@ -10,6 +10,7 @@ from typing import Any, Tuple
 import numpy as np
 
 from app.config import Settings
+from app.contracts import AgentMemoryProtocol
 from app.schemas import ForecastRequest, ForecastResponse
 
 logger = logging.getLogger(__name__)
@@ -60,10 +61,12 @@ class DriftMonitor:
         self,
         valkey: Any,
         settings: Settings,
+        agent_memory: AgentMemoryProtocol | None = None,
         window_size: int = 100,
     ) -> None:
         self.valkey = valkey
         self.settings = settings
+        self.agent_memory = agent_memory
         self.window_size = window_size
 
         self._residuals: dict[str, deque[float]] = {}
@@ -87,10 +90,15 @@ class DriftMonitor:
         self._ensure_model_version_state(dataset_id, model_version)
         
         method, score = self._get_current_drift_score(dataset_id, model_version)
+
+        no_drift_threshold = float(self.settings.no_drift_threshold)
+        major_drift_threshold = float(
+            getattr(self.settings, "major_drift_threshold", self.settings.minor_drift_threshold)
+        )
         
-        if score < self.settings.no_drift_threshold:
+        if score < no_drift_threshold:
             return "none"
-        if score < self.settings.minor_drift_threshold:
+        if score < major_drift_threshold:
             return "minor"
         return "major"
 
@@ -160,6 +168,11 @@ class DriftMonitor:
     async def _run_detection(self, dataset_id: str, model_version: str) -> None:
         self._last_check_times[dataset_id] = datetime.now(tz=timezone.utc)
 
+        no_drift_threshold = float(self.settings.no_drift_threshold)
+        major_drift_threshold = float(
+            getattr(self.settings, "major_drift_threshold", self.settings.minor_drift_threshold)
+        )
+
         # Baseline must be populated asynchronously here in Stage 5, not Stage 3.
         await self._get_or_init_baseline(dataset_id, model_version)
         
@@ -167,13 +180,39 @@ class DriftMonitor:
 
         logger.info("DriftMonitor %s: drift score=%.3f (%s)", dataset_id, score, method)
 
-        if score >= self.settings.minor_drift_threshold:
+        if score >= major_drift_threshold:
+            await self._record_drift_event(dataset_id, method, "major", score)
             logger.warning("DriftMonitor: MAJOR drift for %s (score=%.3f)", dataset_id, score)
             await self._handle_major_drift(dataset_id, method, score)
-        elif score >= self.settings.no_drift_threshold:
+        elif score >= no_drift_threshold:
+            await self._record_drift_event(dataset_id, method, "minor", score)
             logger.info("DriftMonitor: MINOR drift for %s (score=%.3f)", dataset_id, score)
             # Minor drift does not trigger background retrain queue in the new architecture.
             # It just tags the state for inline update on the next triage.
+
+    async def _record_drift_event(
+        self,
+        dataset_id: str,
+        method: str,
+        level: str,
+        score: float,
+    ) -> None:
+        if self.agent_memory is None:
+            return
+
+        try:
+            await self.agent_memory.record_drift_event(
+                dataset_id=dataset_id,
+                method=method,
+                level=level,
+                score=score,
+            )
+        except Exception as exc:
+            logger.warning(
+                "DriftMonitor: AgentMemory drift event write failed for %s: %s",
+                dataset_id,
+                exc,
+            )
 
     def _ensure_dataset_state(self, dataset_id: str) -> None:
         if dataset_id not in self._residuals:

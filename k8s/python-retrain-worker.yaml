@@ -1,20 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: python-worker
+  name: python-retrain-worker
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
-      app: python-worker
+      app: python-retrain-worker
   template:
     metadata:
       labels:
-        app: python-worker
+        app: python-retrain-worker
     spec:
       containers:
-        - name: worker
+        - name: retrain-worker
           image: sktime-agentic-worker:latest
+          command: ["python", "-m", "app.retrain_worker"]
           resources:
             requests:
               cpu: 100m
@@ -22,26 +23,12 @@ spec:
             limits:
               cpu: 500m
               memory: 1Gi
-          ports:
-            - containerPort: 8000
           env:
             - name: VALKEY_URL
               value: redis://valkey:6379
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow:5000
             - name: ENABLE_FORECAST_WORKER
-              value: "true"
-            - name: ENABLE_RETRAIN_WORKER
               value: "false"
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 8000
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            - name: ENABLE_RETRAIN_WORKER
+              value: "true"

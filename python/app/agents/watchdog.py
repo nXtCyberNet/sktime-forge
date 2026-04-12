@@ -136,10 +136,9 @@ class Watchdog:
                     baseline_score=baseline_score,
                     degradation_ratio=degradation_ratio,
                 )
-                # Stop monitoring whether we queued or found a lock already present.
-                # In both cases a retrain is either in flight or just scheduled —
-                # continuing to poll adds no value.
-                if queued or not queued:
+                # Stop once retraining is queued or already in-flight.
+                # If queue publication failed, keep monitoring and try again.
+                if queued:
                     should_stop = True
                     continue
             else:
@@ -240,8 +239,8 @@ class Watchdog:
 
         Returns
         -------
-        True  — job was successfully queued
-        False — a lock was already present (another retrain already in progress)
+        True  — retrain is queued or already in progress
+        False — queue publication failed; monitoring should continue
         """
         lock_key = _RETRAIN_LOCK.format(dataset_id=dataset_id)
 
@@ -253,7 +252,7 @@ class Watchdog:
                     "stopping monitoring",
                     dataset_id,
                 )
-                return False
+                return True
 
             await self.valkey.setex(lock_key, self._lock_ttl, "1")
 

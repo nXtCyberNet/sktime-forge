@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 from typing import Dict, Any, Optional
 
@@ -25,10 +27,10 @@ class MCPClient:
     def _get_data(self, dataset_id: str) -> np.ndarray:
         if self.data_loader:
             return self.data_loader(dataset_id)
-        # Deterministic mock — seed from dataset_id hash so different datasets
-        # produce different series. The original always used seed=42, which
-        # masked bugs in dataset-specific branching logic during tests.
-        seed = int(hash(dataset_id) % 2**31)
+        # Deterministic mock — seed from stable SHA256 so results are repeatable
+        # across process restarts (unlike Python's salted hash()).
+        digest = hashlib.sha256(dataset_id.encode("utf-8")).digest()
+        seed = int.from_bytes(digest[:8], byteorder="big", signed=False) % (2**31)
         rng  = np.random.default_rng(seed=seed)
         return rng.standard_normal(100)
 
