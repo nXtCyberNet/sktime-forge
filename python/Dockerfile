@@ -11,6 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
+COPY tests/ ./tests/
 
 # Health / ready probes hit port 8000
 EXPOSE 8000

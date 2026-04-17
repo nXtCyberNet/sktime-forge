@@ -161,11 +161,21 @@ class TrainingAgent:
             )
             return None
 
-        # ---- 3. Ensure MLflow experiment exists ----
+        # ---- 3. Fetch 'sp' (seasonal period) from DataProfile ----
+        sp = 1
+        try:
+            profile_json = await self.valkey.get(f"profile:{dataset_id}")
+            if profile_json:
+                prof = json.loads(profile_json)
+                sp = int(prof.get("seasonality", {}).get("period", 1) or 1)
+        except Exception as exc:
+            logger.warning("TrainingAgent: failed to load profile to get sp: %s", exc)
+
+        # ---- 4. Ensure MLflow experiment exists ----
         experiment_name = f"ts-{dataset_id}"
         experiment_id   = self._ensure_experiment(experiment_name, dataset_id)
 
-        # ---- 4. Train and evaluate each candidate in order ----
+        # ---- 5. Train and evaluate each candidate in order ----
         results: list[dict[str, Any]] = []
         loop = asyncio.get_running_loop()
 
@@ -179,6 +189,7 @@ class TrainingAgent:
                     y_val=y_val,
                     experiment_id=experiment_id,
                     reason=reason,
+                    sp=sp,
                 ),
             )
             if result is not None:
@@ -251,6 +262,7 @@ class TrainingAgent:
         y_val: np.ndarray,
         experiment_id: str | None,
         reason: str,
+        sp: int = 1,
     ) -> dict[str, Any] | None:
         """
         Fit a single estimator, evaluate it, and log an MLflow run.
@@ -277,7 +289,7 @@ class TrainingAgent:
         )
 
         try:
-            estimator = self._instantiate_estimator(estimator_name)
+            estimator = self._instantiate_estimator(estimator_name, sp=sp)
         except (ImportError, ValueError) as exc:
             logger.error(
                 "TrainingAgent: cannot instantiate %s: %s", estimator_name, exc
@@ -373,7 +385,7 @@ class TrainingAgent:
     # Estimator factory
     # ------------------------------------------------------------------
 
-    def _instantiate_estimator(self, name: str) -> Any:
+    def _instantiate_estimator(self, name: str, sp: int = 1) -> Any:
         """
         Lazily import and instantiate a sktime-compatible estimator by name.
 
@@ -388,9 +400,20 @@ class TrainingAgent:
                 f"Known names: {sorted(_ESTIMATOR_MAP)}"
             )
         module_path, class_name, default_kwargs = _ESTIMATOR_MAP[name]
+        
+        # Inject 'sp' for seasonal models
+        kwargs = dict(default_kwargs)
+        if name in ("AutoETS", "AutoARIMA", "ExponentialSmoothing", "TBATS", "BATS"):
+            kwargs["sp"] = sp
+            if name == "ExponentialSmoothing":
+                if sp > 1:
+                    kwargs["seasonal"] = "add"
+                else:
+                    kwargs.pop("seasonal", None)
+
         mod = importlib.import_module(module_path)
         cls = getattr(mod, class_name)
-        return cls(**default_kwargs)
+        return cls(**kwargs)
 
     def _log_model_artifact(self, estimator: Any, estimator_name: str) -> bool:
         """

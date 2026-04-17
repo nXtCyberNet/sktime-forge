@@ -38,9 +38,15 @@ class Settings(BaseSettings):
     drift_check_every_t_minutes: int = 10  # was DRIFT_CHECK_EVERY_N_MINUTES in .env.example (typo)
 
     # Prediction
+    prediction_timeout_seconds: int = 30
     incremental_update_wait_seconds: int = 10
     default_horizon: int = 10
     prediction_interval_coverage: float = 0.9
+
+    # Cache TTL hints
+    cache_ttl_high_frequency_seconds: int = 900
+    cache_ttl_daily_seconds: int = 21600
+    cache_ttl_low_frequency_seconds: int = 86400
 
     # Worker role toggles
     enable_forecast_worker: bool = True
@@ -62,7 +68,12 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = "http://localhost:5000"
     mlflow_artifact_uri: str = "s3://sktime-agentic-models"
 
+    # Object storage hints
+    s3_bucket: str = ""
+    s3_region: str = ""
+
     # Optional runtime-injected callables (not from .env)
+    local_dataset_dir: str = ""    # optional folder for local CSV data loader
     data_loader: object = None      # callable(dataset_id: str) -> np.ndarray
     memory_loader: object = None    # callable(dataset_id: str) -> dict
     early_stop_mae: float | None = None

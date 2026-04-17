@@ -72,6 +72,7 @@ class MCPClient:
         return {
             "dataset_id":      dataset_id,
             "n_observations":  len(y),
+            "variance":        float(np.var(y)),
             "narrative":       " ".join(narrative_parts),
             "stationarity":    stationarity,
             "seasonality":     seasonality,

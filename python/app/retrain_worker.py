@@ -12,6 +12,7 @@ import redis.asyncio as redis
 from app.agents.watchdog import Watchdog
 from app.config import Settings
 from app.contracts import AgentMemoryProtocol, WatchdogProtocol
+from app.data.local_loader import build_data_loader
 from app.mcp.client import MCPClient
 from app.memory.memory import AgentMemory
 from app.orchestrator import Orchestrator
@@ -27,6 +28,10 @@ async def _run() -> None:
     mlflow_client = MlflowClient(tracking_uri=settings.mlflow_tracking_uri)
 
     data_loader = getattr(settings, "data_loader", None)
+    if data_loader is None:
+        local_dataset_dir = str(getattr(settings, "local_dataset_dir", "") or "").strip()
+        data_loader = build_data_loader(local_dataset_dir or None)
+        settings.data_loader = data_loader
     memory_loader = getattr(settings, "memory_loader", None)
     mcp_client = MCPClient(data_loader=data_loader, memory_loader=memory_loader)
     agent_memory: AgentMemoryProtocol = AgentMemory(valkey)

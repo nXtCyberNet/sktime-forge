@@ -285,6 +285,7 @@ class ModelSelectorAgent:
         - Anthropic: {"content": [{"type": "text", "text": "..."}]}
         - Fallback:  {"output_text": "..."} or {"text": "..."}
         """
+        logger.error(f"DEBUG: LLM raw body: {json.dumps(body)}")
         # OpenAI-compatible
         choices = body.get("choices")
         if isinstance(choices, list) and choices:
@@ -298,6 +299,9 @@ class ModelSelectorAgent:
                 text = first.get("text")
                 if isinstance(text, str) and text.strip():
                     return text
+                    
+        # If we failed to parse but choices was present, log everything
+        logger.error(f"DEBUG LLM choices block failed. choices={choices}")
 
         # Anthropic-style
         text = self._content_to_text(body.get("content"))

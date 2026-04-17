@@ -10,11 +10,14 @@ services:
     image: ghcr.io/mlflow/mlflow:latest
     ports:
       - "5000:5000"
+    volumes:
+      - mlflow-artifacts:/mlartifacts
     command: >
       mlflow server
       --host 0.0.0.0
       --backend-store-uri sqlite:///mlflow.db
-      --default-artifact-root s3://sktime-agentic-models
+      --default-artifact-root file:///mlartifacts
+      --allowed-hosts localhost,127.0.0.1,mlflow,mlflow:5000
 
   minio:
     image: minio/minio:latest
@@ -33,10 +36,13 @@ services:
       context: ./python
       dockerfile: Dockerfile
     env_file:
-      - ./python/.env.example
+      - ./python/.env
     environment:
+      VALKEY_URL: "redis://valkey:6379"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
       ENABLE_FORECAST_WORKER: "true"
       ENABLE_RETRAIN_WORKER: "false"
+      LOCAL_DATASET_DIR: "/app/tests/fixtures/sample_datasets"
     ports:
       - "8000:8000"
     depends_on:
@@ -49,10 +55,13 @@ services:
       context: ./python
       dockerfile: Dockerfile
     env_file:
-      - ./python/.env.example
+      - ./python/.env
     environment:
+      VALKEY_URL: "redis://valkey:6379"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
       ENABLE_FORECAST_WORKER: "false"
       ENABLE_RETRAIN_WORKER: "true"
+      LOCAL_DATASET_DIR: "/app/tests/fixtures/sample_datasets"
     command: ["python", "-m", "app.retrain_worker"]
     depends_on:
       - valkey
@@ -75,3 +84,4 @@ services:
 volumes:
   valkey-data:
   minio-data:
+  mlflow-artifacts:

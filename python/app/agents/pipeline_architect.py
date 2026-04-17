@@ -101,6 +101,7 @@ class PipelineArchitectAgent:
         profile = DataProfile(
             dataset_id        = dataset_id,
             n_observations    = profile_raw["n_observations"],
+            variance          = profile_raw.get("variance", 0.0),
             narrative         = profile_raw["narrative"],
             stationarity      = profile_raw["stationarity"],
             seasonality       = profile_raw["seasonality"],
