@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
@@ -80,6 +81,7 @@ func (h *Handler) Forecast(c *fiber.Ctx) error {
 		)
 	}
 
+	_ = h.valkey.SetCachedPrediction(cacheKey, result, time.Hour)
 	return c.Type("application/json").SendString(result)
 }
 

@@ -1,4 +1,4 @@
-package valkey
+﻿package valkey
 
 import (
 	"context"
@@ -73,6 +73,10 @@ func (c *Client) GetCachedPrediction(cacheKey string) (string, bool, error) {
 		return "", false, err
 	}
 	return value, true, nil
+}
+
+func (c *Client) SetCachedPrediction(cacheKey string, value string, ttl time.Duration) error {
+	return c.rdb.Set(c.ctx, cacheKey, value, ttl).Err()
 }
 
 func (c *Client) EnqueueForecastJob(jobID string, datasetID string, fh []int, frequency string, correlationID string) error {
