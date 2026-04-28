@@ -294,10 +294,44 @@ pip install -e ".[all]"
 cp .env.example .env
 # set ANTHROPIC_API_KEY, MLFLOW_TRACKING_URI, VALKEY_URL
 
-# Start the MCP server
-python -m sktime_agentic.mcp.server
+# Start the local services
+# Option A: use local Python MLflow server instead of Docker MLflow
+# Open a separate terminal and run:
+python python/scripts/start_local_mlflow.py
 
-# Run the agent on a dataset
+# Then run the demo directly from your host Python environment:
+python python/scripts/run_demo.py --dataset_id airline
+
+# Option B: use Docker for Valkey and MLflow
+# In one terminal:
+docker compose up -d valkey mlflow
+
+# In another terminal, run the demo inside the python-worker container:
+docker compose run --rm python-worker python scripts/run_demo.py --dataset_id airline
+```
+
+## Local demo using sample CSV data
+
+You can also run the demo against a sample CSV file from `python/tests/fixtures/sample_datasets`:
+
+```bash
+docker compose run --rm python-worker python scripts/run_demo.py \
+  --dataset_id m4_monthly_subset_like.csv
+```
+
+```bash
+python python/scripts/run_demo.py --dataset_id airline \
+  --valkey_url redis://localhost:6379 \
+  --mlflow_tracking_uri http://localhost:5000
+```
+
+```bash
+python python/scripts/run_demo.py --dataset_id yahoo_s5_like_drift.csv \
+  --local_dataset_dir python/tests/fixtures/sample_datasets
+```
+
+```bash
+# Run the agent on a dataset with the original loop entrypoint
 python -m sktime_agentic.agent.loop \
   --trigger cold_start \
   --dataset_id my_sales_series \

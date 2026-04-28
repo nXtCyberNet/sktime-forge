@@ -6,19 +6,6 @@ services:
     volumes:
       - valkey-data:/data
 
-  mlflow:
-    image: ghcr.io/mlflow/mlflow:latest
-    ports:
-      - "5000:5000"
-    volumes:
-      - mlflow-artifacts:/mlartifacts
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --backend-store-uri sqlite:///mlflow.db
-      --default-artifact-root file:///mlartifacts
-      --allowed-hosts localhost,127.0.0.1,mlflow,mlflow:5000
-
   minio:
     image: minio/minio:latest
     ports:
@@ -39,7 +26,7 @@ services:
       - ./python/.env
     environment:
       VALKEY_URL: "redis://valkey:6379"
-      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MLFLOW_TRACKING_URI: "http://172.21.112.1:5000"
       ENABLE_FORECAST_WORKER: "true"
       ENABLE_RETRAIN_WORKER: "false"
       LOCAL_DATASET_DIR: "/app/tests/fixtures/sample_datasets"
@@ -49,6 +36,8 @@ services:
       - valkey
       - mlflow
       - minio
+    volumes:
+      - mlflow-artifacts:/mlartifacts
 
   retrain-worker:
     build:
@@ -58,7 +47,7 @@ services:
       - ./python/.env
     environment:
       VALKEY_URL: "redis://valkey:6379"
-      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+      MLFLOW_TRACKING_URI: "http://172.21.112.1:5000"
       ENABLE_FORECAST_WORKER: "false"
       ENABLE_RETRAIN_WORKER: "true"
       LOCAL_DATASET_DIR: "/app/tests/fixtures/sample_datasets"
@@ -67,6 +56,8 @@ services:
       - valkey
       - mlflow
       - minio
+    volumes:
+      - mlflow-artifacts:/mlartifacts
 
   go-gateway:
     build:

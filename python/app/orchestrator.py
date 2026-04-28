@@ -232,7 +232,11 @@ class Orchestrator:
         selector_input: Any,
     ) -> str | None:
         try:
-            await self.pipeline_architect.construct_pipeline(dataset_id)
+            frequency_hint = self._extract_frequency_hint(selector_input)
+            await self.pipeline_architect.construct_pipeline(
+                dataset_id,
+                frequency_hint=frequency_hint,
+            )
             await self.model_selector.select(selector_input)
             model_version = await self.training_agent.handle_retrain_job(
                 {"dataset_id": dataset_id, "reason": reason}
@@ -680,6 +684,24 @@ class Orchestrator:
         if not values:
             raise ValueError("fh is empty")
         return [int(v) for v in values]
+
+    @staticmethod
+    def _extract_frequency_hint(selector_input: Any) -> str | None:
+        raw_value = None
+        if isinstance(selector_input, dict):
+            raw_value = selector_input.get("frequency")
+        else:
+            raw_value = getattr(selector_input, "frequency", None)
+
+        if raw_value is None:
+            return None
+
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        if text.lower() == "unknown":
+            return None
+        return text
 
     async def _publish_result(self, correlation_id: str, payload: str) -> None:
         key = f"{self._result_key_prefix}{correlation_id}"

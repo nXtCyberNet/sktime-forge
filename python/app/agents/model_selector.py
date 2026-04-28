@@ -55,23 +55,22 @@ class ModelSelectorAgent:
         )
         logger.info("ModelSelectorAgent.select: starting for dataset_id=%s", dataset_id)
 
-        # ---- 1. Load DataProfile from Valkey ----
         profile: DataProfile = await self._load_profile(dataset_id)
         profile_allowed = allowed_for_profile(profile)
         if not profile_allowed:
             profile_allowed = ["NaiveForecaster"]
 
-        # ---- 2. Enrich with MLflow history ----
         mlflow_context = self._fetch_mlflow_context(dataset_id)
 
-        # ---- 3. Ask the LLM ----
         raw_candidates: list[str] = await self._llm_select(profile, mlflow_context)
 
-        # ---- 4. Constrain and validate against registry + profile budget ----
+        from sktime.registry import all_estimators
+        valid_sktime_forecasters = {name for name, _ in all_estimators(estimator_types="forecaster")}
+
         allowed_set = set(profile_allowed)
         candidates: list[str] = []
         for estimator in raw_candidates:
-            if estimator in allowed_set and estimator not in candidates:
+            if estimator in allowed_set and estimator in valid_sktime_forecasters and estimator not in candidates:
                 candidates.append(estimator)
 
         if not candidates:
@@ -92,7 +91,6 @@ class ModelSelectorAgent:
             )
             candidates = profile_allowed[:1]
 
-        # ---- 5. Persist to Valkey ----
         key = _CANDIDATE_KEY.format(dataset_id=dataset_id)
         await self.valkey.setex(key, _CANDIDATE_TTL, json.dumps(candidates))
         logger.info(
@@ -102,22 +100,11 @@ class ModelSelectorAgent:
 
         return candidates
 
-    # ------------------------------------------------------------------
-    # LLM selection
-    # ------------------------------------------------------------------
-
     async def _llm_select(
         self,
         profile: DataProfile,
         mlflow_context: dict[str, Any] | None = None,
     ) -> list[str]:
-        """
-        Send the full DataProfile to the configured LLM and parse a ranked
-        list of estimator class names from the response.
-
-        On any error (transport, parse, etc.) falls back gracefully to the
-        full permitted list from the complexity budget.
-        """
         system_prompt = "\n".join([
             "You are a time-series model selection expert embedded in an automated ML pipeline.",
             "Your sole output must be a JSON array of estimator class names, ranked from most",
@@ -277,14 +264,6 @@ class ModelSelectorAgent:
         return url, headers, payload
 
     def _extract_text_from_response(self, body: dict[str, Any]) -> str:
-        """
-        Extract the text string from a provider response body.
-
-        Handles three shapes:
-        - OpenAI:    {"choices": [{"message": {"content": "..."}}]}
-        - Anthropic: {"content": [{"type": "text", "text": "..."}]}
-        - Fallback:  {"output_text": "..."} or {"text": "..."}
-        """
         logger.error(f"DEBUG: LLM raw body: {json.dumps(body)}")
         # OpenAI-compatible
         choices = body.get("choices")
@@ -296,6 +275,9 @@ class ModelSelectorAgent:
                     text = self._content_to_text(message.get("content"))
                     if text:
                         return text
+                    reasoning = message.get("reasoning")
+                    if isinstance(reasoning, str) and reasoning.strip():
+                        return reasoning
                 text = first.get("text")
                 if isinstance(text, str) and text.strip():
                     return text
@@ -335,13 +317,6 @@ class ModelSelectorAgent:
 
     @staticmethod
     def _parse_candidate_response(raw_text: str) -> list[str]:
-        """
-        Parse the LLM response into a list of estimator class name strings.
-
-        Accepts:
-        - A bare JSON array:  ["AutoARIMA", "Prophet", "NaiveForecaster"]
-        - A JSON object with a known list key (candidates / ranked / estimators / models)
-        """
         parsed = json.loads(raw_text)
 
         if isinstance(parsed, list):
@@ -356,10 +331,6 @@ class ModelSelectorAgent:
         raise ValueError(
             f"Expected a JSON array of estimator class names, got: {type(parsed).__name__}"
         )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     async def _load_profile(self, dataset_id: str) -> DataProfile:
         """Load the DataProfile written by PipelineArchitectAgent from Valkey."""

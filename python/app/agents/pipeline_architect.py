@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any
 
@@ -14,40 +13,22 @@ _PROFILE_TTL = 3600  # 1 hour — long enough for a full training run
 
 
 class PipelineArchitectAgent:
-    """
-    Parameters
-    ----------
-    valkey     : async Valkey/Redis client (redis.asyncio compatible)
-    mcp_client : app.mcp.client.MCPClient
-    settings   : app.config.Settings
-    """
-
     def __init__(self, valkey, mcp_client, settings):
         self.valkey   = valkey
         self.mcp      = mcp_client
         self.settings = settings
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
 
-    async def construct_pipeline(self, dataset_id: str) -> DataProfile:
-        """
-        Build and cache the full DataProfile for *dataset_id*.
+    async def construct_pipeline(
+        self,
+        dataset_id: str,
+        frequency_hint: str | None = None,
+    ) -> DataProfile:
 
-        All synchronous MCP calls are dispatched via run_in_executor so they
-        do not block the asyncio event loop.
-
-        Returns
-        -------
-        DataProfile
-            Ready to pass directly to ModelSelectorAgent.
-        """
         logger.info("PipelineArchitectAgent.construct_pipeline: starting for %s", dataset_id)
         loop = asyncio.get_running_loop()
 
-        # ---- 1. Full diagnostic profile (single synchronous MCP call, off-thread) ----
-        freq = self._infer_freq(dataset_id)
+        freq = self._clean_frequency_hint(frequency_hint)
         profile_raw: dict[str, Any] = await loop.run_in_executor(
             None, lambda: self.mcp.profile_dataset(dataset_id, freq=freq)
         )
@@ -56,7 +37,6 @@ class PipelineArchitectAgent:
             dataset_id, profile_raw.get("narrative"),
         )
 
-        # ---- 2. Production history (off-thread) ----
         history: dict[str, Any] = await loop.run_in_executor(
             None, lambda: self.mcp.get_dataset_history(dataset_id)
         )
@@ -65,7 +45,6 @@ class PipelineArchitectAgent:
             history.get("status"), dataset_id,
         )
 
-        # ---- 3. Targeted drill-down when profile signals ambiguity ----
         stationarity     = profile_raw["stationarity"]
         structural_break = profile_raw["structural_break"]
 
@@ -85,11 +64,11 @@ class PipelineArchitectAgent:
             refined_break: dict[str, Any] = await loop.run_in_executor(
                 None, lambda: self.mcp.check_structural_break(dataset_id)
             )
-            # Only override if the refined result disagrees with the profile result
+            
             if refined_break["break_detected"] != structural_break["break_detected"]:
                 profile_raw["structural_break"] = refined_break
 
-        # ---- 4. Training-cost estimates for all permitted models (off-thread) ----
+        
         complexity_budget  = profile_raw["complexity_budget"]
         permitted_models   = complexity_budget.get("permitted_models", [])
         seasonality_period = profile_raw["seasonality"].get("period") or 1
@@ -97,7 +76,7 @@ class PipelineArchitectAgent:
             loop, dataset_id, permitted_models, seasonality_period
         )
 
-        # ---- 5. Assemble DataProfile ----
+        
         profile = DataProfile(
             dataset_id        = dataset_id,
             n_observations    = profile_raw["n_observations"],
@@ -111,7 +90,7 @@ class PipelineArchitectAgent:
             training_costs    = training_costs,
         )
 
-        # ---- 6. Persist to Valkey ----
+        
         key = _PROFILE_KEY.format(dataset_id=dataset_id)
         await self.valkey.setex(key, _PROFILE_TTL, profile.model_dump_json())
         logger.info(
@@ -121,31 +100,16 @@ class PipelineArchitectAgent:
 
         return profile
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _infer_freq(self, dataset_id: str) -> str | None:
-        """
-        Infer sampling frequency from the dataset_id naming convention.
-
-        Examples
-        --------
-        "sales_weekly_store42" → "W"
-        "iot_hourly_sensor7"   → "H"
-        anything else          → None  (let MCP auto-detect)
-        """
-        lowered = dataset_id.lower()
-        freq_hints = {
-            "hourly":  "H",
-            "daily":   "D",
-            "weekly":  "W",
-            "monthly": "M",
-        }
-        for hint, freq in freq_hints.items():
-            if hint in lowered:
-                return freq
-        return None
+    @staticmethod
+    def _clean_frequency_hint(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.lower() == "unknown":
+            return None
+        return text
 
     async def _estimate_costs(
         self,

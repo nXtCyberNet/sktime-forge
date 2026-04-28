@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import time
 
@@ -12,18 +13,23 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 import redis.asyncio as redis
 
 from app.agents.watchdog import Watchdog
+from app.agents.chat_router import ChatRouterAgent
 from app.config import Settings
 from app.contracts import AgentMemoryProtocol, WatchdogProtocol
 from app.data.local_loader import build_data_loader
 from app.mcp.client import MCPClient
 from app.memory.memory import AgentMemory
 from app.orchestrator import Orchestrator
+from app.registry.data_registry import DataRegistry
 from app.schemas import (
     AdminModelResponse,
     AdminRetrainRequest,
     AdminRetrainResponse,
+    ChatRequest,
+    FrequencyForecastResponse,
     ForecastRequest,
     ForecastResponse,
+    MultiFrequencyForecastResponse,
 )
 
 app = FastAPI(title="sktime-agentic")
@@ -106,6 +112,11 @@ async def startup_event() -> None:
     app.state.agent_memory = agent_memory
     app.state.watchdog = watchdog
     app.state.orchestrator = orchestrator
+    
+    app.state.data_registry = DataRegistry(valkey)
+
+    chat_router = ChatRouterAgent(settings, data_loader)
+    app.state.chat_router = chat_router
 
 
 @app.on_event("shutdown")
@@ -157,6 +168,86 @@ async def forecast(request: ForecastRequest) -> ForecastResponse:
     started = time.perf_counter()
     try:
         return await orchestrator.handle_job(request)
+    except Exception as exc:
+        FORECAST_ERRORS_TOTAL.inc()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        FORECAST_LATENCY_SECONDS.observe(max(0.0, time.perf_counter() - started))
+
+
+@app.post("/chat", response_model=ForecastResponse | MultiFrequencyForecastResponse)
+async def chat_interaction(request: ChatRequest) -> ForecastResponse | MultiFrequencyForecastResponse:
+    chat_router: ChatRouterAgent = app.state.chat_router
+    orchestrator: Orchestrator = app.state.orchestrator
+    data_registry: DataRegistry = app.state.data_registry
+
+    # 1. Discover available datasets dynamically from Valkey registry.
+    dataset_records = await data_registry.get_all_records()
+    
+    # Optional fallback for testing without adding any streams
+    if not dataset_records:
+        dataset_records = {
+            "airline": {
+                "description": "Monthly totals of international airline passengers. (Built-in Fallback)",
+                "frequency": "M",
+            }
+        }
+                
+    # 2. Parse request via Agent
+    try:
+        forecast_requests = await chat_router.route_request(request.query, dataset_records)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if len(forecast_requests) == 1:
+        forecast_request = forecast_requests[0]
+        FORECAST_REQUESTS_TOTAL.inc()
+        started = time.perf_counter()
+        try:
+            return await orchestrator.handle_job(forecast_request)
+        except Exception as exc:
+            FORECAST_ERRORS_TOTAL.inc()
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            FORECAST_LATENCY_SECONDS.observe(max(0.0, time.perf_counter() - started))
+        
+    # 3. Multi-frequency chat request: run one forecast per selected dataset.
+    FORECAST_REQUESTS_TOTAL.inc(len(forecast_requests))
+    started = time.perf_counter()
+
+    try:
+        results = await asyncio.gather(
+            *(orchestrator.handle_job(job) for job in forecast_requests),
+            return_exceptions=True,
+        )
+
+        forecasts: list[FrequencyForecastResponse] = []
+        for job, result in zip(forecast_requests, results):
+            if isinstance(result, Exception):
+                FORECAST_ERRORS_TOTAL.inc()
+                forecasts.append(
+                    FrequencyForecastResponse(
+                        dataset_id=job.dataset_id,
+                        frequency=job.frequency,
+                        error=str(result),
+                    )
+                )
+            else:
+                forecasts.append(
+                    FrequencyForecastResponse(
+                        dataset_id=job.dataset_id,
+                        frequency=job.frequency,
+                        forecast=result,
+                    )
+                )
+
+        if not any(item.forecast is not None for item in forecasts):
+            first_error = forecasts[0].error if forecasts else "all frequency forecasts failed"
+            raise HTTPException(status_code=500, detail=str(first_error))
+
+        return MultiFrequencyForecastResponse(forecasts=forecasts)
+    except HTTPException:
+        raise
     except Exception as exc:
         FORECAST_ERRORS_TOTAL.inc()
         raise HTTPException(status_code=500, detail=str(exc)) from exc

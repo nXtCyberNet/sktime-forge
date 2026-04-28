@@ -36,6 +36,21 @@ class ForecastResponse(BaseModel):
     correlation_id: str
 
 
+class FrequencyForecastResponse(BaseModel):
+    dataset_id: str
+    frequency: Optional[str] = None
+    forecast: Optional[ForecastResponse] = None
+    error: Optional[str] = None
+
+
+class MultiFrequencyForecastResponse(BaseModel):
+    forecasts: List[FrequencyForecastResponse]
+
+
+class ChatRequest(BaseModel):
+    query: str
+
+
 class RetrainJob(BaseModel):
     dataset_id: str
     reason: str

@@ -462,6 +462,24 @@ class TrainingAgent:
                 return self.mlflow.create_experiment(
                     experiment_name, tags={"dataset_id": dataset_id}
                 )
+            if getattr(exp, "lifecycle_stage", "active") == "deleted":
+                try:
+                    self.mlflow.restore_experiment(exp.experiment_id)
+                    logger.info(
+                        "TrainingAgent: restored deleted MLflow experiment %s (%s)",
+                        experiment_name,
+                        exp.experiment_id,
+                    )
+                    return exp.experiment_id
+                except Exception as restore_exc:
+                    logger.warning(
+                        "TrainingAgent: failed to restore deleted experiment %s: %s",
+                        experiment_name,
+                        restore_exc,
+                    )
+                    return self.mlflow.create_experiment(
+                        experiment_name, tags={"dataset_id": dataset_id}
+                    )
             return exp.experiment_id
         except Exception as exc:
             logger.warning(
