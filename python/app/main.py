@@ -181,10 +181,8 @@ async def chat_interaction(request: ChatRequest) -> ForecastResponse | MultiFreq
     orchestrator: Orchestrator = app.state.orchestrator
     data_registry: DataRegistry = app.state.data_registry
 
-    # 1. Discover available datasets dynamically from Valkey registry.
     dataset_records = await data_registry.get_all_records()
     
-    # Optional fallback for testing without adding any streams
     if not dataset_records:
         dataset_records = {
             "airline": {
@@ -193,7 +191,6 @@ async def chat_interaction(request: ChatRequest) -> ForecastResponse | MultiFreq
             }
         }
                 
-    # 2. Parse request via Agent
     try:
         forecast_requests = await chat_router.route_request(request.query, dataset_records)
     except Exception as exc:
@@ -211,7 +208,6 @@ async def chat_interaction(request: ChatRequest) -> ForecastResponse | MultiFreq
         finally:
             FORECAST_LATENCY_SECONDS.observe(max(0.0, time.perf_counter() - started))
         
-    # 3. Multi-frequency chat request: run one forecast per selected dataset.
     FORECAST_REQUESTS_TOTAL.inc(len(forecast_requests))
     started = time.perf_counter()
 

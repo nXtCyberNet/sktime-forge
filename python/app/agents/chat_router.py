@@ -12,11 +12,6 @@ from app.schemas import ForecastRequest
 logger = logging.getLogger(__name__)
 
 class ChatRouterAgent:
-    """
-    An agent that takes an unstructured natural language string, reviews available
-    datasets, and leverages the LLM to extract structured forecasting requirements.
-    """
-
     def __init__(self, settings, data_loader=None):
         self.settings = settings
         self.data_loader = data_loader

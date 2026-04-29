@@ -26,10 +26,6 @@ class AgentMemory:
     def __init__(self, valkey):
         self.valkey = valkey
 
-    # ------------------------------------------------------------------
-    # Read
-    # ------------------------------------------------------------------
-
     async def get_dataset_memory(self, dataset_id: str) -> dict[str, Any]:
         """
         Load the full memory dict for *dataset_id*.
@@ -54,10 +50,6 @@ class AgentMemory:
             )
             return _empty_memory()
 
-    # ------------------------------------------------------------------
-    # Write
-    # ------------------------------------------------------------------
-
     async def update_dataset_memory(
         self,
         dataset_id: str,
@@ -77,7 +69,6 @@ class AgentMemory:
         """
         current = await self.get_dataset_memory(dataset_id)
 
-        # ---- Append model history entry ----
         model_entry: dict | None = updates.pop("append_model_history", None)
         if model_entry is not None:
             if "promoted_at" not in model_entry:
@@ -85,7 +76,6 @@ class AgentMemory:
             current["model_history"].append(model_entry)
             current["model_history"] = current["model_history"][-_MAX_MODEL_HISTORY:]
 
-        # ---- Append drift event ----
         drift_entry: dict | None = updates.pop("append_drift_event", None)
         if drift_entry is not None:
             if "triggered_at" not in drift_entry:
@@ -93,15 +83,11 @@ class AgentMemory:
             current["drift_events"].append(drift_entry)
             current["drift_events"] = current["drift_events"][-_MAX_DRIFT_EVENTS:]
 
-        # ---- Shallow-merge data_characteristics ----
         chars_update: dict | None = updates.pop("data_characteristics", None)
         if chars_update is not None:
             current["data_characteristics"].update(chars_update)
-
-        # ---- Merge any remaining keys directly ----
         current.update(updates)
 
-        # ---- Persist ----
         key = _MEMORY_KEY.format(dataset_id=dataset_id)
         try:
             await self.valkey.setex(key, _MEMORY_TTL, json.dumps(current))
@@ -111,9 +97,6 @@ class AgentMemory:
                 dataset_id, exc,
             )
 
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
 
     async def record_model_promotion(
         self,

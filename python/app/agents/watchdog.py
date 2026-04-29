@@ -38,10 +38,6 @@ class Watchdog:
         self._degrad_thresh = getattr(settings, "watchdog_degradation_thresh", _DEFAULT_DEGRADATION_THRESH)
         self._lock_ttl      = getattr(settings, "retrain_lock_ttl_seconds",   _RETRAIN_LOCK_TTL_S)
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
     async def monitor_post_promotion(
         self,
         dataset_id: str,
@@ -93,7 +89,6 @@ class Watchdog:
                 )
                 break
 
-            # ---- Poll residuals ----
             residuals = await self._fetch_residuals(dataset_id, model_version)
             n_obs     = len(residuals)
 
@@ -105,7 +100,6 @@ class Watchdog:
                 await asyncio.sleep(self._poll_interval)
                 continue
 
-            # ---- Compute live MAE ----
             live_mae           = float(np.mean(np.abs(residuals)))
             degradation_ratio  = (live_mae - baseline_score) / max(baseline_score, 1e-8)
 
@@ -118,7 +112,6 @@ class Watchdog:
                 n_obs,
             )
 
-            # ---- Verdict ----
             if degradation_ratio > self._degrad_thresh:
                 logger.warning(
                     "Watchdog: DEGRADATION DETECTED for %s v%s — "
@@ -136,8 +129,6 @@ class Watchdog:
                     baseline_score=baseline_score,
                     degradation_ratio=degradation_ratio,
                 )
-                # Stop once retraining is queued or already in-flight.
-                # If queue publication failed, keep monitoring and try again.
                 if queued:
                     should_stop = True
                     continue
@@ -153,10 +144,6 @@ class Watchdog:
         logger.info(
             "Watchdog: monitoring complete for %s v%s", dataset_id, model_version
         )
-
-    # ------------------------------------------------------------------
-    # Residual collection
-    # ------------------------------------------------------------------
 
     async def record_residual(
         self,
@@ -219,10 +206,6 @@ class Watchdog:
             )
             return np.array([], dtype=float)
 
-    # ------------------------------------------------------------------
-    # Retrain queue
-    # ------------------------------------------------------------------
-
     async def _queue_retrain(
         self,
         dataset_id: str,
@@ -280,10 +263,6 @@ class Watchdog:
                 "Watchdog: failed to queue retrain for %s: %s", dataset_id, exc
             )
             return False
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     async def _resolve_model_version(self, dataset_id: str) -> str | None:
         """Read the active model version set by TrainingAgent in Valkey."""

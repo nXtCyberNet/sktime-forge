@@ -1,13 +1,23 @@
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
+import sys
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    
+logging.basicConfig(level=logging.INFO)
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root))
 
+import mlflow
 import pandas as pd
+import numpy as np
 import redis.asyncio as redis
 from mlflow.tracking import MlflowClient
 from sktime.datasets import load_airline
@@ -18,6 +28,21 @@ from app.memory.memory import AgentMemory
 from app.agents.watchdog import Watchdog
 from app.orchestrator import Orchestrator
 from app.schemas import ForecastRequest
+
+
+# --- New generic data loader wired into settings ---
+def data_loader(dataset_id: str) -> np.ndarray:
+    """Generic loader - extend this dict as you add datasets."""
+    loaders = {
+        "airline": load_airline,
+        # "m4_monthly": lambda: load_m4_weekly()["y"],
+        # "electricity": load_electricity,
+    }
+    if dataset_id not in loaders:
+        raise ValueError(
+            f"Unknown dataset_id: {dataset_id}. Register it in data_loader."
+        )
+    return np.asarray(loaders[dataset_id](), dtype=float)
 
 
 def build_dataset_loader(local_dataset_dir: Path):
@@ -78,6 +103,8 @@ async def main() -> None:
 
     root = Path(__file__).resolve().parents[1]
     env_file = root / ".env"
+    if not env_file.exists():
+        env_file = root.parent / ".env"
     settings = Settings(_env_file=env_file)
 
     if args.valkey_url:
@@ -86,6 +113,14 @@ async def main() -> None:
         settings.mlflow_tracking_uri = args.mlflow_tracking_uri
     if args.local_dataset_dir:
         settings.local_dataset_dir = args.local_dataset_dir
+
+    # --- Inject the new loader into settings ---
+    settings.data_loader = data_loader
+
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+
+    print("Using Valkey URL:", settings.valkey_url)
+    print("Using MLflow tracking URI:", settings.mlflow_tracking_uri)
 
     dataset_dir = Path(
         settings.local_dataset_dir

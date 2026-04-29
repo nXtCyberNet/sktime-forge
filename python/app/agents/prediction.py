@@ -36,14 +36,7 @@ class PredictionAgent:
         self.mlflow   = mlflow_client
         self.settings = settings
 
-        # In-process model cache keyed by (dataset_id, model_version).
-        # Shared by all requests in the same process to avoid repeated
-        # MLflow artifact downloads.
         self._local_cache: dict[tuple[str, str], Any] = {}
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
 
     async def predict(
         self,
@@ -76,7 +69,7 @@ class PredictionAgent:
 
         cache = model_cache if model_cache is not None else self._local_cache
 
-        # ---- 1. Resolve model version ----
+        
         if model_version is None:
             model_version = await self._resolve_model_version(dataset_id)
 
@@ -86,12 +79,12 @@ class PredictionAgent:
                 f"dataset_id={dataset_id}. Run TrainingAgent first."
             )
 
-        # ---- 2. Load model (cache → MLflow) ----
+        
         cache_key = (dataset_id, model_version)
         cache_hit = cache_key in cache
         model     = await self._load_model(dataset_id, model_version, cache)
 
-        # ---- 3. Run inference off the event loop (sktime is not async-safe) ----
+       
         t0 = time.monotonic()
         try:
             predictions, prediction_intervals = await asyncio.get_running_loop().run_in_executor(
@@ -107,7 +100,6 @@ class PredictionAgent:
 
         elapsed_ms = (time.monotonic() - t0) * 1000
 
-        # ---- 4. Build response ----
         response = ForecastResponse(
             dataset_id    = dataset_id,
             predictions   = predictions,
@@ -123,7 +115,6 @@ class PredictionAgent:
             correlation_id= job.correlation_id,
         )
 
-        # ---- 5. Increment prediction counter (fire-and-forget) ----
         asyncio.ensure_future(self._increment_pred_count(dataset_id))
 
         logger.info(
@@ -133,33 +124,35 @@ class PredictionAgent:
         )
         return response
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
-
     def _run_inference(
         self,
         model: Any,
         fh_values: list[int],
     ) -> tuple[list[float], dict[str, list[float]] | None]:
-        """
-        Call model.predict() with a proper ForecastingHorizon.
-
-        sktime requires a ForecastingHorizon (not a raw np.ndarray).
-        is_relative=True means "1 step ahead, 2 steps ahead, …" relative to
-        the end of the training series.
-        """
-        # MLflow pyfunc models expect tabular input; native sktime forecasters
-        # expect a ForecastingHorizon.
-        if hasattr(model, "unwrap_python_model"):
-            raw = model.predict(pd.DataFrame({"fh": fh_values}))
-            return self._to_float_list(raw), None
-
-        fh = ForecastingHorizon(fh_values, is_relative=True)
-        raw = model.predict(fh)
-        predictions = self._to_float_list(raw)
-        intervals = self._try_predict_intervals(model, fh)
-        return predictions, intervals
+    
+        try:
+            fh = ForecastingHorizon(fh_values, is_relative=True)
+            raw = model.predict(fh)
+            predictions = self._to_float_list(raw)
+            intervals = self._try_predict_intervals(model, fh)
+            return predictions, intervals
+        except Exception as exc:
+           
+            logger.debug(
+                "PredictionAgent: native ForecastingHorizon predict failed: %s; "
+                "trying pyfunc DataFrame approach",
+                exc,
+            )
+            try:
+                raw = model.predict(fh=list(fh_values))
+                predictions = self._to_float_list(raw)
+                return predictions, None
+            except Exception as pyfunc_exc:
+                logger.error(
+                    "PredictionAgent: both native and pyfunc predict failed: %s / %s",
+                    exc, pyfunc_exc,
+                )
+                raise exc  
 
     @staticmethod
     def _to_float_list(raw: Any) -> list[float]:
@@ -277,10 +270,6 @@ class PredictionAgent:
             return None
         return {"lower": lower, "upper": upper}
 
-    # ------------------------------------------------------------------
-    # Model loading
-    # ------------------------------------------------------------------
-
     async def _load_model(
         self,
         dataset_id: str,
@@ -314,28 +303,44 @@ class PredictionAgent:
         """
         Download and return the fitted model artifact from MLflow.
 
-        Tries mlflow.sklearn first (logged by TrainingAgent), then
-        mlflow.pyfunc as a generic fallback.
+        Prioritizes pyfunc (which preserves full sktime pipelines with transforms),
+        falls back to sklearn for simple estimators.
         """
         model_name = f"ts-forecaster-{dataset_id}"
         model_uri  = f"models:/{model_name}/{model_version}"
 
+        # Try pyfunc first (handles full pipelines with transforms)
         try:
-            return mlflow.sklearn.load_model(model_uri)
-        except Exception:
-            pass
+            model = mlflow.sklearn.load_model(model_uri)
+            logger.debug(
+                "PredictionAgent: loaded %s v%s as pyfunc model",
+                model_name, model_version,
+            )
+            return model
+        except Exception as pyfunc_exc:
+            logger.debug(
+                "PredictionAgent: pyfunc load failed for %s v%s: %s",
+                model_name, model_version, pyfunc_exc,
+            )
 
+        # Fall back to sklearn for backward compatibility
         try:
-            return mlflow.pyfunc.load_model(model_uri)
-        except Exception as exc:
-            raise RuntimeError(
-                f"PredictionAgent: cannot load model {model_name} v{model_version} "
-                f"from MLflow: {exc}"
-            ) from exc
+            model = mlflow.sklearn.load_model(model_uri)
+            logger.debug(
+                "PredictionAgent: loaded %s v%s as sklearn model",
+                model_name, model_version,
+            )
+            return model
+        except Exception as sklearn_exc:
+            logger.debug(
+                "PredictionAgent: sklearn load failed for %s v%s: %s",
+                model_name, model_version, sklearn_exc,
+            )
 
-    # ------------------------------------------------------------------
-    # Version resolution
-    # ------------------------------------------------------------------
+        raise RuntimeError(
+            f"PredictionAgent: cannot load model {model_name} v{model_version} "
+            f"from MLflow (tried pyfunc and sklearn)"
+        )
 
     async def _resolve_model_version(self, dataset_id: str) -> str | None:
         """
@@ -343,7 +348,7 @@ class PredictionAgent:
         1. Valkey (set by TrainingAgent after promotion — fastest path).
         2. MLflow registry fallback (latest version in any stage).
         """
-        # -- Valkey --
+       
         try:
             key = _MODEL_VER_KEY.format(dataset_id=dataset_id)
             raw = await self.valkey.get(key)
@@ -360,7 +365,7 @@ class PredictionAgent:
                 dataset_id, exc,
             )
 
-        # -- MLflow fallback --
+    
         try:
             model_name = f"ts-forecaster-{dataset_id}"
             versions   = self.mlflow.get_latest_versions(
@@ -382,10 +387,6 @@ class PredictionAgent:
             )
 
         return None
-
-    # ------------------------------------------------------------------
-    # Telemetry
-    # ------------------------------------------------------------------
 
     async def _increment_pred_count(self, dataset_id: str) -> None:
         """Increment the per-dataset prediction counter in Valkey."""

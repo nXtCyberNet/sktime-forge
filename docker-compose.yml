@@ -34,10 +34,7 @@ services:
       - "8000:8000"
     depends_on:
       - valkey
-      - mlflow
       - minio
-    volumes:
-      - mlflow-artifacts:/mlartifacts
 
   retrain-worker:
     build:
@@ -54,10 +51,7 @@ services:
     command: ["python", "-m", "app.retrain_worker"]
     depends_on:
       - valkey
-      - mlflow
       - minio
-    volumes:
-      - mlflow-artifacts:/mlartifacts
 
   go-gateway:
     build:
@@ -75,4 +69,3 @@ services:
 volumes:
   valkey-data:
   minio-data:
-  mlflow-artifacts:

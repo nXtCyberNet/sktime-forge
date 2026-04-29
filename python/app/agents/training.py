@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import time
+import traceback
 from typing import Any
 
 import mlflow
@@ -14,6 +15,9 @@ import mlflow.sklearn
 import numpy as np
 import pandas as pd
 from sktime.forecasting.base import ForecastingHorizon
+from sktime.forecasting.compose import TransformedTargetForecaster
+from sktime.transformations.series.difference import Differencer
+from sktime.transformations.series.detrend import Deseasonalizer
 from sktime.performance_metrics.forecasting import (
     MeanAbsoluteError,
     MeanAbsolutePercentageError,
@@ -34,7 +38,6 @@ _MAE  = MeanAbsoluteError()
 _MAPE = MeanAbsolutePercentageError()
 _RMSE = MeanSquaredError(square_root=True)
 
-# Map estimator class name → (module_path, class_name, default_kwargs)
 _ESTIMATOR_MAP: dict[str, tuple[str, str, dict[str, Any]]] = {
     "NaiveForecaster": (
         "sktime.forecasting.naive", "NaiveForecaster",
@@ -115,10 +118,6 @@ class TrainingAgent:
         self.settings = settings
         self._last_training_summary: dict[str, dict[str, Any]] = {}
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
     async def handle_retrain_job(self, job) -> str | None:
         """
         Train all candidate models and promote the winner to the registry.
@@ -145,14 +144,12 @@ class TrainingAgent:
             dataset_id, reason,
         )
 
-        # ---- 1. Fetch ranked candidate list from Valkey ----
         candidates: list[str] = await self._load_candidates(dataset_id)
         candidates = self._sanitize_candidates(candidates, dataset_id)
         if not candidates:
             logger.error("TrainingAgent: no candidates found for %s – aborting", dataset_id)
             return None
 
-        # ---- 2. Load dataset and split ----
         y_train, y_val = self._load_data(dataset_id)
         if len(y_train) < 5:
             logger.error(
@@ -161,7 +158,6 @@ class TrainingAgent:
             )
             return None
 
-        # ---- 3. Fetch 'sp' (seasonal period) from DataProfile ----
         sp = 1
         try:
             profile_json = await self.valkey.get(f"profile:{dataset_id}")
@@ -171,11 +167,9 @@ class TrainingAgent:
         except Exception as exc:
             logger.warning("TrainingAgent: failed to load profile to get sp: %s", exc)
 
-        # ---- 4. Ensure MLflow experiment exists ----
         experiment_name = f"ts-{dataset_id}"
         experiment_id   = self._ensure_experiment(experiment_name, dataset_id)
 
-        # ---- 5. Train and evaluate each candidate in order ----
         results: list[dict[str, Any]] = []
         loop = asyncio.get_running_loop()
 
@@ -206,8 +200,6 @@ class TrainingAgent:
         if not results:
             logger.error("TrainingAgent: all candidates failed for %s", dataset_id)
             return None
-
-        # ---- 5. Pick best model (lowest val_mae) ----
         best = min(results, key=lambda r: r["val_mae"])
         logger.info(
             "TrainingAgent: best model for %s is %s (val_mae=%.4f)",
@@ -221,22 +213,23 @@ class TrainingAgent:
             "model_version": None,
         }
 
-        # ---- 6. Register in MLflow model registry ----
         model_version = await loop.run_in_executor(
             None, lambda: self._register_model(dataset_id, best)
         )
         if model_version is None:
             return None
 
-        # ---- 7. Persist new model version to Valkey ----
         key = _MODEL_VER_KEY.format(dataset_id=dataset_id)
-        await self.valkey.setex(key, _MODEL_VER_TTL, model_version)
+        try:
+            await self.valkey.setex(key, _MODEL_VER_TTL, model_version)
+        except Exception as exc:
+            logger.warning(
+                "TrainingAgent: Valkey cache write failed (non-fatal): %s", exc
+            )
 
-        # Compatibility keys used by the Go gateway cache/version endpoints.
         await self.valkey.set(f"model:version:{dataset_id}", model_version)
         await self.valkey.set(f"model:class:{dataset_id}", best["estimator_name"])
 
-        # ---- 8. Publish model_updated signal for PredictionAgent cache eviction ----
         await self.valkey.setex(f"model_updated:{dataset_id}", 300, "1")
 
         logger.info(
@@ -249,10 +242,6 @@ class TrainingAgent:
 
     def get_last_training_summary(self, dataset_id: str) -> dict[str, Any] | None:
         return self._last_training_summary.get(dataset_id)
-
-    # ------------------------------------------------------------------
-    # Per-estimator training loop (synchronous — runs in executor)
-    # ------------------------------------------------------------------
 
     def _train_one(
         self,
@@ -279,8 +268,6 @@ class TrainingAgent:
         logger.info("TrainingAgent: fitting %s for %s", estimator_name, dataset_id)
         t0 = time.monotonic()
 
-        # Convert raw arrays to pd.Series with a clean RangeIndex
-        # (sktime requires a pandas Series with a supported index type)
         y_train_s = pd.Series(y_train, index=pd.RangeIndex(len(y_train)), name="y")
         y_val_s   = pd.Series(
             y_val,
@@ -296,8 +283,22 @@ class TrainingAgent:
             )
             return None
 
+        profile_json = None
         try:
-            estimator.fit(y_train_s)
+            profile_json = asyncio.run(self.valkey.get(f"profile:{dataset_id}"))
+        except Exception as exc:
+            logger.warning(
+                "TrainingAgent: failed to load profile for %s: %s", dataset_id, exc
+            )
+
+        pipeline = self._build_training_pipeline(
+            estimator=estimator,
+            profile_json=profile_json,
+            sp=sp,
+        )
+
+        try:
+            pipeline.fit(y_train_s)
         except Exception as exc:
             logger.error(
                 "TrainingAgent: fit failed for %s on %s: %s",
@@ -307,14 +308,12 @@ class TrainingAgent:
 
         elapsed_fit = time.monotonic() - t0
 
-        # ---- Evaluate on validation split ----
         try:
             fh = ForecastingHorizon(
                 list(range(1, len(y_val_s) + 1)), is_relative=True
             )
-            preds: pd.Series = estimator.predict(fh)
+            preds: pd.Series = pipeline.predict(fh)
 
-            # Align indices for metric computation
             preds.index = y_val_s.index
 
             val_mae  = float(_MAE(y_val_s,  preds))
@@ -327,9 +326,6 @@ class TrainingAgent:
             )
             return None
 
-        # ---- Log to MLflow ----
-        # Use the module-level mlflow API (not MlflowClient instance methods).
-        # MlflowClient is a query/management API; mlflow.log_* are logging APIs.
         run_id: str | None = None
         try:
             with mlflow.start_run(experiment_id=experiment_id) as run:
@@ -352,7 +348,7 @@ class TrainingAgent:
                     "dataset_id": dataset_id,
                 })
 
-                model_logged = self._log_model_artifact(estimator, estimator_name)
+                model_logged = self._log_model_artifact(pipeline, estimator_name)
                 if not model_logged:
                     logger.error(
                         "TrainingAgent: model artifact logging failed for %s; "
@@ -373,17 +369,13 @@ class TrainingAgent:
 
         return {
             "estimator_name": estimator_name,
-            "estimator_obj":  estimator,
+            "estimator_obj":  pipeline,
             "val_mae":        val_mae,
             "val_mape":       val_mape,
             "val_rmse":       val_rmse,
             "fit_seconds":    elapsed_fit,
             "run_id":         run_id,
         }
-
-    # ------------------------------------------------------------------
-    # Estimator factory
-    # ------------------------------------------------------------------
 
     def _instantiate_estimator(self, name: str, sp: int = 1) -> Any:
         """
@@ -415,14 +407,75 @@ class TrainingAgent:
         cls = getattr(mod, class_name)
         return cls(**kwargs)
 
+    def _build_training_pipeline(
+        self,
+        estimator: Any,
+        profile_json: str | None,
+        sp: int = 1,
+    ) -> Any:
+        """
+        Wrap the selected forecaster in a TransformedTargetForecaster pipeline.
+
+        This ensures any target transformation step is persisted together
+        with the fitted estimator so MLflow can restore the full pipeline
+        and perform inverse_transform automatically.
+        """
+        steps: list[tuple[str, Any]] = []
+        profile: dict[str, Any] | None = None
+
+        if profile_json:
+            try:
+                profile = json.loads(profile_json)
+            except Exception:
+                profile = None
+
+        if profile is not None:
+            seasonality = profile.get("seasonality", {}) or {}
+            stationarity = profile.get("stationarity", {}) or {}
+
+            if seasonality.get("seasonality_class") not in (None, "none"):
+                seasonality_class = str(seasonality.get("seasonality_class", "")).lower()
+                model = "multiplicative" if "multiplicative" in seasonality_class else "additive"
+                steps.append(("deseasonalizer", Deseasonalizer(model=model, sp=sp)))
+
+            if stationarity.get("conclusion") in ("difference_stationary", "trend_stationary"):
+                steps.append(("differencer", Differencer()))
+
+        steps.append(("forecaster", estimator))
+        return TransformedTargetForecaster(steps=steps)
+
     def _log_model_artifact(self, estimator: Any, estimator_name: str) -> bool:
         """
         Log fitted model artifact under "model" in the active MLflow run.
 
-        Tries sklearn flavor first, then pyfunc fallback for non-sklearn estimators.
+        For sktime TransformedTargetForecaster pipelines, we use pyfunc wrapper
+        to ensure the full pipeline (including inverse_transform) is serialized.
         """
+        from sktime.forecasting.compose import TransformedTargetForecaster
+        
+        # Always use pyfunc for pipelines to preserve full transform chain
+        if isinstance(estimator, TransformedTargetForecaster):
+            try:
+                mlflow.sklearn.log_model(
+                    estimator,
+                    artifact_path="model",                   
+                    serialization_format="cloudpickle"
+                )
+                logger.info(
+                "TrainingAgent: logged %s as sklearn pipeline", estimator_name
+            )
+                return True
+            except Exception as exc:
+                logger.error(
+                    "TrainingAgent: sklearn logging failed for pipeline %s: %s , %s ",
+                    estimator_name, exc , traceback.format_exc()
+                )
+            return False
+        
+        # Try sklearn for simple estimators
         try:
             mlflow.sklearn.log_model(estimator, artifact_path="model")
+            logger.info("TrainingAgent: logged %s as sklearn model", estimator_name)
             return True
         except Exception as log_exc:
             logger.warning(
@@ -439,6 +492,7 @@ class TrainingAgent:
                 python_model=pyfunc_model,
                 input_example=pd.DataFrame({"fh": [1, 2, 3]}),
             )
+            logger.info("TrainingAgent: logged %s as pyfunc (fallback)", estimator_name)
             return True
         except Exception as pyfunc_exc:
             logger.error(
@@ -447,10 +501,6 @@ class TrainingAgent:
                 pyfunc_exc,
             )
             return False
-
-    # ------------------------------------------------------------------
-    # MLflow helpers (synchronous — called from executor)
-    # ------------------------------------------------------------------
 
     def _ensure_experiment(
         self, experiment_name: str, dataset_id: str
@@ -491,14 +541,6 @@ class TrainingAgent:
     def _register_model(
         self, dataset_id: str, best: dict[str, Any]
     ) -> str | None:
-        """
-        Register the best model run in the MLflow model registry.
-
-        Uses the module-level mlflow.register_model (not MlflowClient.register_model
-        which does not exist — MlflowClient has create_model_version instead).
-
-        Returns the version string (e.g. "3") or None on failure.
-        """
         model_name = f"ts-forecaster-{dataset_id}"
         run_id     = best.get("run_id")
 
@@ -508,10 +550,8 @@ class TrainingAgent:
 
         try:
             model_uri = f"runs:/{run_id}/model"
-            # mlflow.register_model is the correct module-level call
             mv = mlflow.register_model(model_uri, model_name)
 
-            # MlflowClient methods for registry management are correct here
             self.mlflow.update_registered_model(
                 model_name,
                 description=(
@@ -533,19 +573,9 @@ class TrainingAgent:
             )
             return None
 
-    # ------------------------------------------------------------------
-    # Data loading
-    # ------------------------------------------------------------------
-
     def _load_data(
         self, dataset_id: str
     ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Load the full time series and split into train / validation arrays.
-
-        Production: uses settings.data_loader callable.
-        Fallback: deterministic mock seeded by dataset_id hash.
-        """
         loader = getattr(self.settings, "data_loader", None)
         if loader is not None:
             y = np.asarray(loader(dataset_id), dtype=float)
@@ -557,10 +587,6 @@ class TrainingAgent:
 
         split = max(5, int(len(y) * (1 - _VALIDATION_FRAC)))
         return y[:split], y[split:]
-
-    # ------------------------------------------------------------------
-    # Candidate loading
-    # ------------------------------------------------------------------
 
     async def _load_candidates(self, dataset_id: str) -> list[str]:
         """Read the ranked candidate list written by ModelSelectorAgent."""
