@@ -2,23 +2,13 @@
 
 **Autonomous time-series forecasting infrastructure driven by an LLM agent.**
 
-A companion repo to [`sktime`](https://github.com/sktime/sktime) and [`sktime-mcp`](https://github.com/sktime/sktime-mcp), built for ESoC 2026.
+A companion repo to [`sktime`](https://github.com/sktime/sktime) and [`sktime-mcp`](https://github.com/sktime/sktime-mcp).
 
 ---
 
-## What This Is
+## How It Works
 
-Most production forecasting systems are deterministic pipelines:
-drift detected → retrain → promote. A rule fires, a script runs, a model swaps.
-The system is automated but not intelligent — it cannot reason about *why* drift
-happened, *whether* retraining is the right response, or *which* model family
-actually suits the data after a structural break.
-
-`sktime-agentic` flips this. Every decision — model selection, retraining,
-promotion, drift response — is made by an LLM agent that calls sktime capabilities
-as MCP tools. The agent investigates, reasons across production history, constructs
-a pipeline, evaluates it, and decides whether to promote. Nothing happens without
-the agent choosing to make it happen.
+Every decision — model selection, training, promotion, drift response — is made by an LLM agent that calls sktime capabilities as MCP tools. The agent investigates the data, reasons across production history, constructs a pipeline, evaluates all candidates, and decides which model to promote. Nothing happens without the agent choosing to make it happen.
 
 ```
 Production event (drift / cold start / human request)
@@ -52,231 +42,243 @@ Production event (drift / cold start / human request)
 │                                                 │
 │  sktime pipelines   MLflow model registry       │
 │  Valkey / Redis     FastAPI serving layer       │
-│  Kafka job queue    S3 / GCS model storage      │
+│  Go API gateway     S3 / GCS model storage      │
 └─────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Why MCP
+## Verified End-to-End: Airline Dataset
 
-[`sktime-mcp`](https://github.com/sktime/sktime-mcp) exposes sktime operations
-as callable tools. `sktime-agentic` uses those tools as the action surface for
-an LLM agent loop — the agent decides which tools to call, in what order, based
-on accumulated production context.
+> Full log: [`docs/full_end_log.md`](docs/full_end_log.md)
 
-`sktime-mcp` knows how to *execute* sktime operations.
-`sktime-agentic` knows *why*, *when*, and *in what sequence* to execute them.
+The following is a real, unedited trace of the system running the `airline` dataset from a cold start — no model in the registry, no cached state. The **LLM is actively driving the tool calls**; it receives the data profile and decides which estimators to rank and why.
 
-This is not a wrapper. sktime-mcp has no memory across runs, no awareness of
-production history, no ability to reason about past model failures or drift
-patterns. The agent holds all of that and uses sktime-mcp as its hands.
+### Step 1 — Cold Start Detected
 
----
+The orchestrator checks MLflow, finds no registered model, and triggers the full agent pipeline.
 
-## Agent Behaviour — A Concrete Example
-
-**Trigger:** drift detected on `sales_weekly`, score = 0.89 (major)
-
-**Without sktime-agentic** (deterministic):
 ```
-drift score > threshold → xadd retrain:jobs → grid search → promote
+WARNING:app.orchestrator: failed MLflow version fallback for airline:
+  RESOURCE_DOES_NOT_EXIST: Registered Model with name=ts-forecaster-airline not found
+INFO:app.orchestrator: cold start flow for dataset_id=airline
 ```
 
-**With sktime-agentic** (LLM agent loop):
+### Step 2 — PipelineArchitectAgent Profiles the Data
+
 ```
-Agent receives:  drift signal + dataset_id + production context
-
-Agent thinks:    "Third retrain this month. Last two runs selected AutoARIMA.
-                 Both degraded within 3 weeks. Let me investigate before
-                 repeating the same mistake."
-
-Agent calls:     profile_dataset("sales_weekly")
-                 → n_obs=312, freq=W, missing_pct=0.0
-
-Agent calls:     run_stationarity_test("sales_weekly")
-                 → non-stationary, ADF p=0.31
-
-Agent calls:     check_structural_break("sales_weekly")
-                 → structural break detected at t=289 (6 weeks ago)
-
-Agent calls:     detect_seasonality("sales_weekly")
-                 → period=52 confirmed, strength=0.81
-
-Agent reasons:   "Structural break 6 weeks ago — likely a regime change,
-                 not parameter drift. AutoARIMA is fitting to pre-break data.
-                 Prophet handles trend changepoints natively. Try it."
-
-Agent calls:     evaluate_model("sales_weekly", "Prophet", {"changepoint_prior_scale": 0.1})
-                 → cv_score = -142.3 (vs AutoARIMA -198.7)
-
-Agent calls:     fit_model("sales_weekly", "Prophet", {"changepoint_prior_scale": 0.1})
-                 → version = "v7", staged
-
-Agent calls:     promote_model("sales_weekly", "v7")
-                 → promoted to Production
-
-Agent writes:    audit log with full reasoning chain
+INFO:app.agents.pipeline_architect: PipelineArchitectAgent.construct_pipeline: starting for airline
+INFO:app.agents.pipeline_architect: PipelineArchitectAgent: DataProfile cached at key=profile:airline (TTL=3600s)
 ```
 
-The agent reached a conclusion a rule-based system structurally cannot: that the
-*same* retrain trigger, on the *same* dataset, should produce a *different*
-model family this time, because of accumulated failure history.
+### Step 3 — ModelSelectorAgent Calls the LLM (ReAct loop)
 
----
+The LLM receives the data profile and a list of permitted estimators. It reasons through the following chain of thought in real time before returning its ranked list:
 
-## MCP Tool Reference
+> *"Dataset: non-stationary, strong seasonality, structural break detected.*
+> *If structural break, prefer models that handle changepoints natively (Prophet) or are robust to level shifts (NaiveForecaster, ExponentialSmoothing) over ARIMA-family models.*
+> *If non-stationary, prefer models that do not require stationarity. Since break is present, avoid AutoARIMA.*
+> *If seasonality strong, prefer models that model seasonality explicitly (Prophet, TBATS, ExponentialSmoothing).*
+> *Always include at least one simple baseline (NaiveForecaster) at the end as a last-resort fallback.*"*
 
-All tools are exposed via `sktime-mcp`. The agent calls these via the MCP
-protocol — no direct Python imports in the agent loop.
+```
+INFO:app.agents.model_selector: ModelSelectorAgent.select: starting for dataset_id=airline
+INFO:httpx: HTTP Request: POST https://ai.hackclub.com/proxy/v1/chat/completions "HTTP/1.1 200 OK"
 
-### Data & Profiling
+LLM ranked output: ["Prophet", "ExponentialSmoothing", "TBATS", "NaiveForecaster"]
 
-| Tool | Description | Returns |
-|------|-------------|---------|
-| `profile_dataset(dataset_id)` | Statistical profile of the series | n_obs, freq, missing_pct, mean, std, CV |
-| `get_dataset_history(dataset_id)` | Full production history | past models, scores, failures, drift events |
-| `get_drift_history(dataset_id)` | Drift event log | timestamps, scores, methods, responses |
+INFO:app.agents.model_selector: ModelSelectorAgent: wrote 9 candidates for airline →
+  ['NaiveForecaster', 'ThetaForecaster', 'ExponentialSmoothing', 'PolynomialTrendForecaster',
+   'Prophet', 'TBATS', 'BATS', 'AutoARIMA', 'AutoETS']
+```
 
-### Statistical Tests
+The LLM's top picks (Prophet, TBATS) were unavailable due to missing optional dependencies — the system gracefully fell through to the next available candidates.
 
-| Tool | Description | Returns |
-|------|-------------|---------|
-| `run_stationarity_test(dataset_id)` | ADF + KPSS stationarity tests | p-values, conclusion |
-| `detect_seasonality(dataset_id)` | Seasonal period and strength | period, strength, method |
-| `check_structural_break(dataset_id)` | CUSUM-based break detection | break_detected, location, confidence |
-| `detect_drift(dataset_id)` | Current drift scores | CUSUM score, ADWIN score, residual score |
+### Step 4 — TrainingAgent Fits and Evaluates All Candidates
 
-### Training & Evaluation
+Each candidate is fitted as a `TransformedTargetForecaster` sktime pipeline and logged to MLflow. Results are compared by `val_mae` on a held-out validation split.
 
-| Tool | Description | Returns |
-|------|-------------|---------|
-| `list_candidate_models()` | Available sktime estimators | model names + metadata |
-| `evaluate_model(dataset_id, model, params)` | CV evaluation without fitting | cv_score, fold_scores, duration |
-| `fit_model(dataset_id, model, params)` | Fit and stage a model | version, staging_uri |
-| `cross_validate_model(dataset_id, model, params, n_splits)` | Full CV with fold detail | per-fold scores, mean, std |
-| `promote_model(dataset_id, version)` | Promote staged → Production | confirmation |
-| `reject_model(dataset_id, version)` | Archive a staged model | confirmation |
-| `update_model(dataset_id)` | Incremental update (no full retrain) | updated version |
+```
+INFO:app.agents.training: TrainingAgent.handle_retrain_job: dataset_id=airline reason=cold_start
 
-### Serving & State
+INFO:app.agents.training: fitting AutoETS for airline
+INFO:app.agents.training: logged AutoETS as sklearn pipeline
+🏃 View run thoughtful-sow-779 at: http://localhost:5000/#/experiments/1/runs/b641e32f86f24fd09ddd36ebf870f590
+INFO:app.agents.training: AutoETS → val_mae=25.1520 val_rmse=29.7411 fit_seconds=2.1
 
-| Tool | Description | Returns |
-|------|-------------|---------|
-| `get_forecast(dataset_id, fh)` | Get prediction from Production model | predictions, model_version, cached |
-| `get_production_model(dataset_id)` | Current Production model info | version, estimator, cv_score, promoted_at |
-| `get_model_history(dataset_id)` | All model versions + outcomes | versions, scores, promotion history |
-| `get_retrain_queue()` | Pending retrain jobs | queue contents |
+INFO:app.agents.training: fitting ExponentialSmoothing for airline
+INFO:app.agents.training: logged ExponentialSmoothing as sklearn pipeline
+🏃 View run monumental-mare-275 at: http://localhost:5000/#/experiments/1/runs/1d500b73f61643bb93747a900e424fec
+INFO:app.agents.training: ExponentialSmoothing → val_mae=43.4961 val_rmse=51.9158 fit_seconds=0.2
+
+INFO:app.agents.training: fitting ThetaForecaster for airline
+INFO:app.agents.training: logged ThetaForecaster as sklearn pipeline
+🏃 View run colorful-horse-931 at: http://localhost:5000/#/experiments/1/runs/6e63ee0ae5a047068d09b605945da47a
+INFO:app.agents.training: ThetaForecaster → val_mae=91.3702 val_rmse=102.4195 fit_seconds=0.0
+
+INFO:app.agents.training: fitting PolynomialTrendForecaster for airline
+INFO:app.agents.training: logged PolynomialTrendForecaster as sklearn pipeline
+🏃 View run brawny-whale-483 at: http://localhost:5000/#/experiments/1/runs/6f47b1cbd2694856a624354d1be5a21b
+INFO:app.agents.training: PolynomialTrendForecaster → val_mae=34.5551 val_rmse=48.1882 fit_seconds=0.0
+
+INFO:app.agents.training: fitting NaiveForecaster for airline
+INFO:app.agents.training: logged NaiveForecaster as sklearn pipeline
+🏃 View run skillful-shoat-878 at: http://localhost:5000/#/experiments/1/runs/d008500d2e704357bfec096232199f71
+INFO:app.agents.training: NaiveForecaster → val_mae=81.4483 val_rmse=93.1339 fit_seconds=0.0
+```
+
+**Model comparison summary:**
+
+| Model | val_mae | val_rmse | fit_seconds |
+|---|---|---|---|
+| **AutoETS** ✅ | **25.1520** | **29.7411** | 2.1 |
+| PolynomialTrendForecaster | 34.5551 | 48.1882 | 0.0 |
+| ExponentialSmoothing | 43.4961 | 51.9158 | 0.2 |
+| NaiveForecaster | 81.4483 | 93.1339 | 0.0 |
+| ThetaForecaster | 91.3702 | 102.4195 | 0.0 |
+
+### Step 5 — Winner Promoted to MLflow Registry
+
+```
+INFO:app.agents.training: best model for airline is AutoETS (val_mae=25.1520)
+
+Successfully registered model 'ts-forecaster-airline'.
+INFO mlflow.store.model_registry.abstract_store: Waiting up to 300 seconds for model version to finish creation.
+  Model name: ts-forecaster-airline, version 1
+Created version '1' of model 'ts-forecaster-airline'.
+
+INFO:app.agents.training: promoted model version 1 for airline
+```
+
+### Step 6 — PredictionAgent Serves the Forecast
+
+```
+INFO:app.agents.prediction: PredictionAgent: loading model from MLflow for airline v1
+INFO:app.agents.watchdog: Watchdog: starting post-promotion monitoring for airline v1
+  (baseline_mae=25.1520, ttl=3600s)
+INFO:app.agents.prediction: PredictionAgent: served 6-step forecast for airline v1 in 25.8 ms (cache_hit=False)
+```
+
+### Step 7 — Final Forecast Response
+
+```json
+{
+  "dataset_id": "airline",
+  "predictions": [483.756, 429.041, 373.516, 326.012, 370.046, 375.170],
+  "prediction_intervals": {
+    "lower": [457.318, 399.325, 344.051, 293.409, 330.630, 333.390],
+    "upper": [510.689, 458.569, 405.015, 357.596, 411.413, 417.687]
+  },
+  "model_version": "1",
+  "model_class": "TransformedTargetForecaster",
+  "model_status": "ok",
+  "llm_rationale": "Forecast generated for dataset airline using TransformedTargetForecaster (version 1)
+    over 6 horizon steps. First predictions: 483.756, 429.041, 373.516.
+    Prediction intervals are included to show forecast uncertainty.
+    No active drift signal is attached to this response.",
+  "cache_hit": false,
+  "correlation_id": "demo-run"
+}
+```
 
 ---
 
 ## Architecture
 
-### Components
+### Actual Project Layout
 
 ```
 sktime-agentic/
-├── agent/
-│   ├── loop.py              # ReAct agent loop — the main entry point
-│   ├── memory.py            # Persistent production memory across runs
-│   ├── prompts.py           # System prompt + context assembly
-│   └── tools.py             # MCP tool call wrappers for the agent
+├── python/
+│   ├── app/
+│   │   ├── agents/
+│   │   │   ├── chat_router.py        # NL query → structured ForecastRequest
+│   │   │   ├── model_selector.py     # ReAct loop: LLM calls MCP tools to rank models
+│   │   │   ├── pipeline_architect.py # Profiles data, writes DataProfile to Valkey
+│   │   │   ├── prediction.py         # Loads model from MLflow, runs inference
+│   │   │   ├── training.py           # Fits + evaluates all candidates, promotes winner
+│   │   │   └── watchdog.py           # Post-promotion MAE monitoring, queues retrain
+│   │   ├── mcp/
+│   │   │   ├── client.py             # MCPClient: dispatches tool calls to implementations
+│   │   │   ├── check_structural_break.py
+│   │   │   ├── detect_seasonality.py
+│   │   │   ├── estimate_training_cost.py
+│   │   │   ├── get_dataset_history.py
+│   │   │   ├── get_model_complexity_budget.py
+│   │   │   └── run_stationarity_test.py
+│   │   ├── memory/
+│   │   │   └── memory.py             # Per-dataset history in Valkey (model history, drift events)
+│   │   ├── monitoring/
+│   │   │   └── drift_monitor.py      # CUSUM + ADWIN detection, publishes signal only
+│   │   ├── registry/
+│   │   │   ├── registry.py           # CANDIDATE_ESTIMATORS, profile-based filtering
+│   │   │   └── data_registry.py      # Dataset record store in Valkey
+│   │   ├── data/
+│   │   │   └── local_loader.py       # CSV loader for local fixture datasets
+│   │   ├── config.py                 # Pydantic Settings — reads from .env
+│   │   ├── contracts.py              # Protocol interfaces (AgentMemory, Watchdog)
+│   │   ├── main.py                   # FastAPI app: /forecast, /chat, /admin/*, /metrics
+│   │   ├── orchestrator.py           # Coordinates cold-start and retrain flows
+│   │   ├── prompts/prompts.py        # System prompts for each LLM agent
+│   │   ├── retrain_worker.py         # Valkey stream consumer for retrain:jobs
+│   │   └── schemas.py                # Pydantic request/response models
+│   ├── scripts/
+│   │   ├── run_demo.py               # Local end-to-end demo runner
+│   │   ├── cold_start_aeroplane.py   # Seed + cold-start for aeroplane dataset
+│   │   ├── ingest_data.py            # Push a CSV dataset into Valkey
+│   │   └── start_local_mlflow.py     # Start MLflow tracking server locally
+│   ├── tests/
+│   │   ├── fixtures/sample_datasets/ # Curated CSVs for testing
+│   │   └── unit/                     # Agent unit tests
+│   └── requirements.txt
 │
-├── mcp/
-│   └── server.py            # FastMCP server — exposes all tools above
-│
-├── infrastructure/
-│   ├── drift_monitor.py     # CUSUM + ADWIN — publishes signals, no decisions
-│   ├── prediction_cache.py  # 3-tier: in-memory → Valkey → MLflow
-│   ├── model_registry.py    # MLflow lifecycle helpers
-│   └── data_loader.py       # Dataset fetching from S3/GCS
-│
-├── api/
-│   └── main.py              # FastAPI: /forecast, /health, /admin
-│
-├── go/
-│   ├── gateway/             # API gateway + request routing
-│   └── orchestrator/        # Kafka consumer → agent trigger
-│
-└── tests/
-    ├── test_agent_loop.py   # Agent reasoning tests with mocked tools
-    ├── test_mcp_tools.py    # Tool correctness tests
-    └── test_drift.py        # Drift detection tests
+├── go/                               # Go API gateway (request routing, Valkey bridge)
+├── k8s/                              # Kubernetes manifests for all services
+├── docs/                             # Architecture docs, problem log, full run logs
+├── data_cache/                       # Airline CSV (built-in fallback dataset)
+├── docker-compose.yml                # Valkey + MLflow + Python/Go workers
+└── .env.example                      # All required environment variables
 ```
 
 ### What Each Layer Does
 
-**Agent loop (`agent/loop.py`)**
-The LLM runs a ReAct loop: observe the trigger + production context, reason,
-call an MCP tool, observe the result, reason again, repeat until a terminal
-action (promote, reject, update, escalate). Every step is logged.
+**`ModelSelectorAgent` (`agents/model_selector.py`)**  
+The core intelligence. Runs a ReAct loop: builds a data profile via `PipelineArchitectAgent`, then calls the LLM with that profile and a list of permitted estimators. The LLM reasons through seasonality, stationarity, structural breaks, and past failures to return a ranked candidate list. Tool calls are dispatched via `MCPClient`. The ranked list is written to Valkey for `TrainingAgent` to consume.
 
-**Persistent memory (`agent/memory.py`)**
-The agent's context is not just the current trigger. It includes the full
-history of every model ever trained on this dataset — CV scores, failure reasons,
-drift patterns, how long each model survived in production. This is what allows
-the agent to avoid repeating past mistakes. Stored in Valkey, keyed by
-`dataset_id`.
+**`TrainingAgent` (`agents/training.py`)**  
+Reads the ranked candidate list, fits each estimator as a `TransformedTargetForecaster` sktime pipeline in a thread executor (non-async), evaluates on a validation split, logs every run to MLflow, picks the lowest `val_mae` winner, and registers it in the MLflow model registry.
 
-**MCP server (`mcp/server.py`)**
-FastMCP server exposing all tools listed above. Wraps sktime operations,
-statistical tests, and MLflow lifecycle calls. This is what the agent calls —
-the agent never imports sktime directly.
+**`PredictionAgent` (`agents/prediction.py`)**  
+Resolves the active model version from Valkey (falls back to MLflow registry), loads the model (with in-process caching to avoid repeated artifact downloads), and runs inference off the event loop in an executor. Returns point forecasts + prediction intervals and an LLM-generated rationale string.
 
-**Drift monitor (`infrastructure/drift_monitor.py`)**
-CUSUM + ADWIN statistical detection. Publishes a signal to the agent trigger
-queue when drift is detected. Makes no decisions — that is the agent's job.
-Previously this triggered retraining directly; now it just notifies the agent.
+**`Watchdog` (`agents/watchdog.py`)**  
+Spawned after every model promotion. Polls residuals from Valkey, computes live MAE, compares against the baseline MAE from training, and queues a retrain job if degradation exceeds the threshold.
 
-**Go layer (`go/`)**
-API gateway for routing external forecast requests.
-Kafka consumer for converting production events into agent triggers.
-Stateless — all state lives in Valkey and MLflow.
+**`Orchestrator` (`orchestrator.py`)**  
+The top-level coordinator. Detects cold-start vs warm-start, chains `PipelineArchitectAgent → ModelSelectorAgent → TrainingAgent → PredictionAgent`, and manages Valkey stream workers.
+
+**`DriftMonitor` (`monitoring/drift_monitor.py`)**  
+CUSUM + ADWIN statistical detection. Publishes a signal only — it makes no decisions. The agent decides what to do in response.
+
+**Go layer (`go/`)**  
+API gateway for routing external forecast requests. Stateless — all state lives in Valkey and MLflow.
 
 ---
 
-## Key Design Decisions
+## MCP Tool Reference
 
-**Why is the LLM the orchestrator and not an advisor?**
+All tools are implemented under `python/app/mcp/` and dispatched by `MCPClient`.
 
-Previous designs used the LLM as a post-hoc auditor — the model was already
-selected and trained, then the LLM reviewed the outcome. This is advisory and
-replaceable with a rule. In `sktime-agentic`, the LLM makes the decision before
-any training happens. If the LLM decides not to retrain, nothing retrains.
+### Statistical Analysis
 
-**Why does the agent need memory across runs?**
-
-A stateless LLM call sees one snapshot. A stateful agent sees that AutoARIMA
-failed on this dataset twice in two months, that drift always follows a pattern
-of 3–4 weeks after a promotional event, that the series has a structural break
-that wasn't present six months ago. That accumulated context is what makes the
-decision genuinely intelligent rather than reflexive.
-
-**Why not just use sktime-mcp directly?**
-
-You can. sktime-mcp exposes individual operations. `sktime-agentic` adds the
-reasoning layer that decides which operations to call, in what order, with what
-parameters, and whether to act on the results. sktime-mcp is the toolbox.
-`sktime-agentic` is the engineer who knows when to use which tool.
-
-**Why keep the deterministic drift monitor?**
-
-CUSUM and ADWIN are better at detecting drift than an LLM polling a dataset.
-The monitor does what statistics does well: signal detection. The agent does
-what LLMs do well: reasoning about what to do in response.
-
----
-
-## Relation to sktime-mcp
-
-| | sktime-mcp | sktime-agentic |
-|---|---|---|
-| **Role** | Tool provider | Agent orchestrator |
-| **Knows** | How to execute sktime operations | Why, when, in what order to call tools |
-| **Memory** | None (stateless) | Full production history per dataset |
-| **Decisions** | None | All of them |
-| **LLM** | Not required | Core component |
-| **Dependency** | — | Depends on sktime-mcp for tools |
+| Tool | Description | Returns |
+|------|-------------|---------|
+| `detect_seasonality` | Seasonal period and strength detection | period, strength, method |
+| `run_stationarity_test` | ADF + KPSS stationarity tests | p-values, conclusion |
+| `check_structural_break` | CUSUM-based break detection | break_detected, location, confidence |
+| `get_dataset_history` | Full production history for a dataset | past models, scores, failures, drift events |
+| `estimate_training_cost` | Cost estimate before fitting | estimated_seconds, complexity |
+| `get_model_complexity_budget` | Budget constraints for model selection | max_params, time_budget |
 
 ---
 
@@ -287,87 +289,33 @@ what LLMs do well: reasoning about what to do in response.
 git clone https://github.com/your-org/sktime-agentic
 cd sktime-agentic
 
-# Install
-pip install -e ".[all]"
+# Set up Python environment
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+pip install -r python/requirements.txt
 
 # Configure
 cp .env.example .env
-# set ANTHROPIC_API_KEY, MLFLOW_TRACKING_URI, VALKEY_URL
+# Edit .env — set LLM_API_KEY, MLFLOW_TRACKING_URI, VALKEY_URL
 
-# Start the local services
-# Option A: use local Python MLflow server instead of Docker MLflow
-# Open a separate terminal and run:
-python python/scripts/start_local_mlflow.py
-
-# Then run the demo directly from your host Python environment:
-python python/scripts/run_demo.py --dataset_id airline
-
-# Option B: use Docker for Valkey and MLflow
-# In one terminal:
+# Option A: run with local MLflow + Valkey from Docker
 docker compose up -d valkey mlflow
+python python/scripts/run_demo.py --dataset_id airline --valkey_url redis://localhost:6379
 
-# In another terminal, run the demo inside the python-worker container:
-docker compose run --rm python-worker python scripts/run_demo.py --dataset_id airline
-```
+# Option B: run MLflow locally without Docker
+python python/scripts/start_local_mlflow.py   # separate terminal
+python python/scripts/run_demo.py --dataset_id airline --valkey_url redis://localhost:6379
 
-## Local demo using sample CSV data
-
-You can also run the demo against a sample CSV file from `python/tests/fixtures/sample_datasets`:
-
-```bash
-docker compose run --rm python-worker python scripts/run_demo.py \
-  --dataset_id m4_monthly_subset_like.csv
-```
-
-```bash
-python python/scripts/run_demo.py --dataset_id airline \
-  --valkey_url redis://localhost:6379 \
-  --mlflow_tracking_uri http://localhost:5000
-```
-
-```bash
-python python/scripts/run_demo.py --dataset_id yahoo_s5_like_drift.csv \
+# Run against a local CSV fixture
+python python/scripts/run_demo.py \
+  --dataset_id yahoo_s5_like_drift.csv \
   --local_dataset_dir python/tests/fixtures/sample_datasets
+
+# Start the FastAPI server
+uvicorn python.app.main:app --reload
+# POST /forecast   {"dataset_id": "airline", "fh": [1,2,3,4,5,6]}
+# POST /chat       {"query": "forecast airline next 6 months"}
 ```
-
-```bash
-# Run the agent on a dataset with the original loop entrypoint
-python -m sktime_agentic.agent.loop \
-  --trigger cold_start \
-  --dataset_id my_sales_series \
-  --data path/to/series.csv
-```
-
-Or connect the MCP server to Claude Desktop and drive everything interactively:
-
-```json
-{
-  "mcpServers": {
-    "sktime-agentic": {
-      "command": "python",
-      "args": ["-m", "sktime_agentic.mcp.server"]
-    }
-  }
-}
-```
-
----
-
-## ESoC 2026
-
-This project is submitted under the **sktime agentic — own idea** track of
-[ESoC 2026](https://github.com/european-summer-of-code/esoc2026), hosted by
-the German Center for Open Source AI.
-
-It contributes to the agentic sktime ecosystem by:
-- Providing a production-grade agent loop that uses sktime-mcp as its tool surface
-- Adding new MCP tools to the sktime-mcp ecosystem (statistical tests, production
-  memory, drift history, structural break detection)
-- Demonstrating a pattern for LLM-driven ML infrastructure that goes beyond
-  single-shot model selection to multi-step, history-aware autonomous operation
-
-Contributions to sktime-mcp made during this project are upstreamed directly
-to the sktime-mcp repository.
 
 ---
 
